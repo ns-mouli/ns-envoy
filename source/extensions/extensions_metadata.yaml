@@ -816,6 +816,13 @@ envoy.filters.listener.proxy_protocol:
   status: stable
   type_urls:
   - envoy.extensions.filters.listener.proxy_protocol.v3.ProxyProtocol
+envoy.filters.listener.qosmos_dpi:
+  categories:
+  - envoy.filters.listener
+  security_posture: requires_trusted_downstream_and_upstream
+  status: alpha
+  type_urls:
+  - envoy.extensions.filters.listener.qosmos_dpi.v3.QosmosDpi
 envoy.filters.listener.set_filter_state:
   categories:
   - envoy.filters.listener
