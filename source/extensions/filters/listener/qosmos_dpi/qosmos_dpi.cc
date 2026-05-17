@@ -2,22 +2,19 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <sys/time.h>
 
 #include <chrono>
 #include <cstdint>
-#include <cstring>
 
 #include "envoy/network/address.h"
 
-#include "source/common/buffer/buffer_impl.h"
 #include "source/common/protobuf/utility.h"
 #include "source/common/tcp_proxy/tcp_proxy.h"
 
 #include "absl/strings/string_view.h"
 
 extern "C" {
-#include "dpi/protodef.h"  // Q_PROTO_IP, Q_PROTO_IP6, Q_PROTO_TCP
+#include "qmdpi_const.h"  // QMDPI_DIR_CTS
 }
 
 namespace Envoy {
@@ -28,7 +25,7 @@ namespace QosmosDpi {
 namespace {
 
 // Stat-prefix scope: all stats land under "qosmos_dpi.<counter>" per the
-// existing extension convention (tls_inspector.tls_inspector.* etc.).
+// existing extension convention.
 QosmosDpiStats generateStats(Stats::Scope& scope) {
   const std::string prefix = "qosmos_dpi.";
   return QosmosDpiStats{ALL_QOSMOS_DPI_STATS(POOL_COUNTER_PREFIX(scope, prefix),
@@ -36,72 +33,45 @@ QosmosDpiStats generateStats(Stats::Scope& scope) {
                                               POOL_HISTOGRAM_PREFIX(scope, prefix))};
 }
 
-// Render the qmdpi_path object as a dotted string. Uses
-// qmdpi_data_path_to_buffer (mirrors dataplane/libs/qosmos_dpi/src/QosmosDpi.cpp:372).
-// Returns empty string if path is null or rendering fails.
-std::string pathToString(qmdpi_bundle* bundle, const qmdpi_path* path) {
-  if (path == nullptr || bundle == nullptr) return {};
-  char buffer[512];
-  int rc = qmdpi_data_path_to_buffer(bundle, buffer, sizeof(buffer), path);
-  if (rc != 0) return {};
-  return std::string(buffer);
-}
-
-// Read the 5-tuple from the accepted socket. Stream-mode Qosmos doesn't
-// strictly need accurate src/dst (the engine uses them as a flow key only
-// — classification is purely byte-driven), but we feed real values so the
-// engine's per-flow logging matches reality.
-struct FiveTuple {
-  int l3proto;        // Q_PROTO_IP or Q_PROTO_IP6
-  int l4proto;        // Q_PROTO_TCP
-  in_addr  v4_src{};  // network byte order
-  in_addr  v4_dst{};
-  in6_addr v6_src{};
-  in6_addr v6_dst{};
-  uint16_t src_port{};  // network byte order
-  uint16_t dst_port{};
-  bool is_v6{false};
-};
-
-// Extract a 5-tuple from the Envoy socket. remoteAddress() = client (CTS src),
+// Read the 5-tuple from the accepted socket. remoteAddress() = client (CTS src),
 // directLocalAddress() = original destination (CTS dst, populated by the
 // kernel via SO_ORIGINAL_DST when iptables REDIRECT/TPROXY is in front of
 // envoy — see Topology A/B docs).
+struct FiveTuple {
+  in_addr  v4_src{};
+  in_addr  v4_dst{};
+  in6_addr v6_src{};
+  in6_addr v6_dst{};
+  uint16_t src_port_nbo{};
+  uint16_t dst_port_nbo{};
+  bool is_v6{false};
+};
+
 FiveTuple readFiveTuple(const Network::ConnectionInfoProvider& info) {
   FiveTuple t{};
   const auto& remote = info.remoteAddress();
   const auto& local = info.directLocalAddress();
   if (remote != nullptr && remote->ip() != nullptr && remote->ip()->ipv4() != nullptr &&
       local != nullptr && local->ip() != nullptr && local->ip()->ipv4() != nullptr) {
-    t.l3proto = Q_PROTO_IP;
-    t.l4proto = Q_PROTO_TCP;
     t.v4_src.s_addr = htonl(remote->ip()->ipv4()->address());
     t.v4_dst.s_addr = htonl(local->ip()->ipv4()->address());
-    t.src_port = htons(remote->ip()->port());
-    t.dst_port = htons(local->ip()->port());
+    t.src_port_nbo = htons(remote->ip()->port());
+    t.dst_port_nbo = htons(local->ip()->port());
     return t;
   }
-  // Fall through: IPv6 (or partial info — caller still tries flow_create
-  // and will log if it fails).
-  t.l3proto = Q_PROTO_IP6;
-  t.l4proto = Q_PROTO_TCP;
+  t.is_v6 = true;
   if (remote != nullptr && remote->ip() != nullptr && remote->ip()->ipv6() != nullptr) {
-    auto a = remote->ip()->ipv6()->address();  // absl::uint128
+    auto a = remote->ip()->ipv6()->address();
     auto* dst = reinterpret_cast<uint8_t*>(&t.v6_src);
-    for (int i = 0; i < 16; ++i) {
-      dst[15 - i] = static_cast<uint8_t>(a >> (i * 8));
-    }
-    t.src_port = htons(remote->ip()->port());
+    for (int i = 0; i < 16; ++i) dst[15 - i] = static_cast<uint8_t>(a >> (i * 8));
+    t.src_port_nbo = htons(remote->ip()->port());
   }
   if (local != nullptr && local->ip() != nullptr && local->ip()->ipv6() != nullptr) {
     auto a = local->ip()->ipv6()->address();
     auto* dst = reinterpret_cast<uint8_t*>(&t.v6_dst);
-    for (int i = 0; i < 16; ++i) {
-      dst[15 - i] = static_cast<uint8_t>(a >> (i * 8));
-    }
-    t.dst_port = htons(local->ip()->port());
+    for (int i = 0; i < 16; ++i) dst[15 - i] = static_cast<uint8_t>(a >> (i * 8));
+    t.dst_port_nbo = htons(local->ip()->port());
   }
-  t.is_v6 = true;
   return t;
 }
 
@@ -112,6 +82,40 @@ FiveTuple readFiveTuple(const Network::ConnectionInfoProvider& info) {
 Config::Config(const ProtoConfig& proto, QosmosEngineSharedPtr engine,
                Stats::Scope& scope)
     : engine_(std::move(engine)),
+      table_(nullptr),  // not owned — engine holds it; table() returns engine_->table().
+      web_cluster_(proto.web_cluster()),
+      non_web_cluster_(proto.non_web_cluster()),
+      silence_timeout_(
+          PROTOBUF_GET_MS_OR_DEFAULT(proto, silence_timeout, 200)),
+      default_tenant_id_(proto.default_tenant_id() == 0 ? 1
+                                                        : proto.default_tenant_id()),
+      max_inspect_bytes_(proto.max_inspect_bytes() == 0 ? 1024
+                                                        : proto.max_inspect_bytes()),
+      close_on_engine_error_(proto.close_on_engine_error()),
+      stats_(generateStats(scope)) {
+  // Production path: classifier factory delegates to the singleton engine.
+  // Capture engine_ by raw pointer (the shared_ptr is held in this Config).
+  QosmosEngine* engine_ptr = engine_.get();
+  classifier_factory_ = [engine_ptr](bool is_v6, const void* src_ip,
+                                      uint16_t src_port_nbo, const void* dst_ip,
+                                      uint16_t dst_port_nbo) {
+    return engine_ptr->makeClassifier(is_v6, src_ip, src_port_nbo, dst_ip,
+                                       dst_port_nbo);
+  };
+}
+
+const ProtocolTable& Config::table() const {
+  // Production: engine owns the table (table_ is null). Tests: table_
+  // was provided directly. We assert at least one is set — the
+  // constructors enforce this.
+  return table_ != nullptr ? *table_ : engine_->table();
+}
+
+Config::Config(const ProtoConfig& proto, ClassifierFactory factory,
+               std::shared_ptr<ProtocolTable> table, Stats::Scope& scope)
+    : engine_(nullptr),
+      table_(std::move(table)),
+      classifier_factory_(std::move(factory)),
       web_cluster_(proto.web_cluster()),
       non_web_cluster_(proto.non_web_cluster()),
       silence_timeout_(
@@ -128,46 +132,49 @@ Config::Config(const ProtoConfig& proto, QosmosEngineSharedPtr engine,
 Filter::Filter(ConfigSharedPtr config) : config_(std::move(config)) {}
 
 Filter::~Filter() {
-  // Defensive: should already be destroyed by onData / onSilenceTimeout /
-  // onClose. If not, we leak engine state if we don't destroy here. The
-  // gauge accounting catches this bug at runtime.
-  if (flow_ != nullptr) {
-    releaseFlow(/*from_verdict_path=*/false);
+  recordClassifierDestruction();
+}
+
+void Filter::recordClassifierDestruction() {
+  // Called from ~Filter. classifier_ may already be empty (if we never
+  // accepted a flow due to engine error in onAccept). If it has a flow
+  // still alive, that means classifyFirstPdu never ran — either silence
+  // timeout fired (already counted via flows_released_at_verdict in
+  // onSilenceTimeout) or the connection closed early (count as
+  // flows_released_at_close).
+  //
+  // We can't tell the two apart from inside the destructor; the
+  // verdict_set_ flag is the discriminator. silence-timeout calls
+  // setVerdict so verdict_set_ is true; early-close hasn't.
+  if (classifier_ == nullptr) return;
+  const bool was_alive = classifier_->flowAlive();
+  classifier_.reset();   // RAII destroy — qmdpi_flow_destroy if needed
+  if (!was_alive) return;
+  if (verdict_set_) {
+    config_->stats().flows_released_at_verdict_.inc();
+  } else {
+    config_->stats().flows_released_at_close_.inc();
   }
+  config_->stats().flows_active_.dec();
 }
 
 Network::FilterStatus Filter::onAccept(Network::ListenerFilterCallbacks& cb) {
   cb_ = &cb;
 
-  auto& worker_obj = config_->engine().workerForThisThread();
-  if (!worker_obj.isValid()) {
-    // Engine startup must have been broken — can't create a flow without
-    // a worker. Fail-safe to non-web (or refuse if so configured).
-    config_->stats().engine_error_.inc();
-    if (config_->closeOnEngineError()) {
-      cb.socket().ioHandle().close();
-      return Network::FilterStatus::StopIteration;
-    }
-    setVerdict(config_->nonWebCluster(), /*is_web=*/false);
-    return Network::FilterStatus::Continue;
-  }
-
   const FiveTuple t = readFiveTuple(cb.socket().connectionInfoProvider());
-  if (t.is_v6) {
-    flow_ = qmdpi_flow_create(worker_obj.raw(), t.l3proto, t.l4proto,
-                              static_cast<const void*>(&t.v6_src),
-                              static_cast<const void*>(&t.src_port),
-                              static_cast<const void*>(&t.v6_dst),
-                              static_cast<const void*>(&t.dst_port));
-  } else {
-    flow_ = qmdpi_flow_create(worker_obj.raw(), t.l3proto, t.l4proto,
-                              static_cast<const void*>(&t.v4_src),
-                              static_cast<const void*>(&t.src_port),
-                              static_cast<const void*>(&t.v4_dst),
-                              static_cast<const void*>(&t.dst_port));
-  }
-  if (flow_ == nullptr) {
-    ENVOY_LOG(warn, "qosmos_dpi: qmdpi_flow_create returned NULL; defaulting to non-web");
+  classifier_ = config_->classifierFactory()(
+      t.is_v6,
+      t.is_v6 ? static_cast<const void*>(&t.v6_src)
+              : static_cast<const void*>(&t.v4_src),
+      t.src_port_nbo,
+      t.is_v6 ? static_cast<const void*>(&t.v6_dst)
+              : static_cast<const void*>(&t.v4_dst),
+      t.dst_port_nbo);
+
+  if (classifier_ == nullptr || !classifier_->flowAlive()) {
+    // Engine couldn't allocate a flow (engine init failed earlier, worker
+    // missing, or qmdpi_flow_create returned NULL). Fail-safe: route to
+    // non-web (or refuse if so configured).
     config_->stats().engine_error_.inc();
     if (config_->closeOnEngineError()) {
       cb.socket().ioHandle().close();
@@ -178,11 +185,7 @@ Network::FilterStatus Filter::onAccept(Network::ListenerFilterCallbacks& cb) {
   }
   config_->stats().flows_active_.inc();
 
-  // Arm the silence timer. For server-greets-first protocols (FTP, SMTP)
-  // the client may stay silent until the server's banner; we default to
-  // CFW after silence_timeout if no client bytes arrive. The phase-1
-  // mandate is "verdict on first client bytes" — silence is a verdict
-  // too (= non-web), and we cannot wait forever.
+  // Arm silence timer for server-greets-first protocols.
   silence_timer_ = cb.dispatcher().createTimer([this]() { onSilenceTimeout(); });
   silence_timer_->enableTimer(config_->silenceTimeout());
 
@@ -191,108 +194,59 @@ Network::FilterStatus Filter::onAccept(Network::ListenerFilterCallbacks& cb) {
 
 Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
   if (verdict_set_) {
-    // Should not happen — once we Continue, Envoy stops calling us. Defensive
-    // no-op so we never re-enter classifyOnFirstPdu after the flow is dead.
     return Network::FilterStatus::Continue;
   }
-
   if (silence_timer_ != nullptr) {
     silence_timer_->disableTimer();
   }
+  if (classifier_ == nullptr || !classifier_->flowAlive()) {
+    // Should not happen — onAccept fail-safed already if classifier was
+    // bad. Defensive.
+    config_->stats().engine_error_.inc();
+    setVerdict(config_->nonWebCluster(), /*is_web=*/false);
+    return Network::FilterStatus::Continue;
+  }
 
   const auto slice = buffer.rawSlice();
-  bytes_inspected_ = slice.len_;
-  config_->stats().bytes_processed_.recordValue(static_cast<uint64_t>(bytes_inspected_));
+  config_->stats().bytes_processed_.recordValue(static_cast<uint64_t>(slice.len_));
 
-  return classifyOnFirstPdu(slice);
-}
+  ClassifyResult cr = classifier_->classifyFirstPdu(
+      slice.mem_, static_cast<int>(slice.len_), QMDPI_DIR_CTS,
+      static_cast<int>(config_->defaultTenantId()));
+  classify_invoked_ = true;
 
-Network::FilterStatus Filter::classifyOnFirstPdu(
-    const Buffer::ConstRawSlice& slice) {
-  auto& worker_obj = config_->engine().workerForThisThread();
-  qmdpi_worker* worker = worker_obj.raw();
-  if (worker == nullptr || flow_ == nullptr) {
+  if (cr.engine_error) {
     config_->stats().engine_error_.inc();
     if (config_->closeOnEngineError() && cb_ != nullptr) {
       cb_->socket().ioHandle().close();
       return Network::FilterStatus::StopIteration;
     }
-    setVerdict(config_->nonWebCluster(), /*is_web=*/false);
-    return Network::FilterStatus::Continue;
+    // Fall through — we may still have a usable path despite the error.
   }
 
-  // Stream-mode PDU set: first_header=0 (no L3/L4 parsing — we only feed
-  // payload bytes), QMDPI_DIR_CTS (client→server is the only direction
-  // the listener filter ever sees). Tenant id from proto config.
-  struct timeval tv;
-  gettimeofday(&tv, nullptr);
-  int rc = qmdpi_worker_pdu_set(
-      worker, slice.mem_, static_cast<int>(slice.len_), &tv,
-      /*first_header=*/0, QMDPI_DIR_CTS,
-      static_cast<int>(config_->defaultTenantId()));
-  if (rc != 0) {
-    ENVOY_LOG(debug, "qosmos_dpi: qmdpi_worker_pdu_set returned {}", rc);
-    // Don't bail here — process can still produce a useful intermediate;
-    // and even if it can't, the unconditional flow_destroy below extracts
-    // whatever the engine has. Increment engine_error so the failure is
-    // observable.
-    config_->stats().engine_error_.inc();
-  }
-
-  qmdpi_result* intermediate = nullptr;
-  rc = qmdpi_worker_process(worker, /*flow=*/nullptr, &intermediate);
-  if (rc != 0) {
-    ENVOY_LOG(debug, "qosmos_dpi: qmdpi_worker_process returned {}", rc);
-    config_->stats().engine_error_.inc();
-  }
-
-  // Cascade against the intermediate path FIRST. Hooks-extraction (ssl:alpn
-  // etc.) is a follow-up — see qosmos-dpi-integration-plan.md §11. Without
-  // hooks, rules 0 and 1 don't fire; flows fall through to rule 2 (CSV) or
-  // rule 4 (default non-web). Conservative behaviour until ALPN extraction
-  // lands.
-  Hooks empty_hooks;  // TODO: populate ssl:alpn from qmdpi_result_attr_getnext.
+  // Run the cascade: intermediate first, then final on inconclusive.
+  // Without ssl:alpn hooks, rules 0/1 don't fire (TODO: wire hook
+  // extraction in a follow-up; cascade falls back to rule 2/3/4).
+  Hooks empty_hooks;
   std::optional<bool> verdict;
-
-  qmdpi_bundle* bundle = config_->engine().rawBundle();
-  if (intermediate != nullptr) {
-    qmdpi_path* path = qmdpi_result_path_get(intermediate);
-    const std::string path_str = pathToString(bundle, path);
-    if (!path_str.empty()) {
-      verdict = config_->engine().table().isWeb(path_str, empty_hooks);
-      ENVOY_LOG(debug, "qosmos_dpi: intermediate path='{}' verdict={}",
-                path_str, verdict.has_value()
-                              ? (*verdict ? "web" : "non-web") : "null");
-    }
+  if (!cr.intermediate_path.empty()) {
+    verdict = config_->table().isWeb(cr.intermediate_path, empty_hooks);
+    ENVOY_LOG(debug, "qosmos_dpi: intermediate path='{}' verdict={}",
+              cr.intermediate_path,
+              verdict.has_value() ? (*verdict ? "web" : "non-web") : "null");
+  }
+  if (!verdict.has_value() && !cr.final_path.empty()) {
+    verdict = config_->table().isWeb(cr.final_path, empty_hooks);
+    ENVOY_LOG(debug, "qosmos_dpi: final-after-destroy path='{}' verdict={}",
+              cr.final_path,
+              verdict.has_value() ? (*verdict ? "web" : "non-web") : "null");
   }
 
-  // ALWAYS qmdpi_flow_destroy() — see plan §1 & §7.4. Whether the verdict
-  // is conclusive or not, the per-flow engine state is no longer needed
-  // (we will not feed more bytes). Destroy returns the engine's final
-  // best-guess result; if the intermediate cascade was inconclusive, we
-  // re-run the cascade against this final result.
-  qmdpi_result* final_result = nullptr;
-  releaseFlow(/*from_verdict_path=*/true, &final_result);
-
-  if (!verdict.has_value() && final_result != nullptr) {
-    qmdpi_path* fpath = qmdpi_result_path_get(final_result);
-    const std::string final_str = pathToString(bundle, fpath);
-    if (!final_str.empty()) {
-      verdict = config_->engine().table().isWeb(final_str, empty_hooks);
-      ENVOY_LOG(debug, "qosmos_dpi: post-destroy path='{}' verdict={}",
-                final_str, verdict.has_value()
-                               ? (*verdict ? "web" : "non-web") : "null");
-    }
-  }
-
-  // Apply the verdict. Default is non-web (CFW). Anything that doesn't
-  // POSITIVELY classify as web stays non-web.
   if (verdict.has_value() && *verdict) {
     setVerdict(config_->webCluster(), /*is_web=*/true);
   } else if (verdict.has_value() && !*verdict) {
     setVerdict(config_->nonWebCluster(), /*is_web=*/false);
   } else {
-    // Both intermediate and post-destroy paths were null/inconclusive.
     config_->stats().inconclusive_forced_cfw_.inc();
     setVerdict(config_->nonWebCluster(), /*is_web=*/false);
   }
@@ -300,14 +254,9 @@ Network::FilterStatus Filter::classifyOnFirstPdu(
 }
 
 void Filter::onSilenceTimeout() {
-  ENVOY_LOG(debug, "qosmos_dpi: silence timeout fired (server-greets-first?), defaulting to {}",
-            config_->nonWebCluster());
+  ENVOY_LOG(debug, "qosmos_dpi: silence timeout fired (server-greets-first?), "
+                    "defaulting to {}", config_->nonWebCluster());
   config_->stats().silence_timeout_.inc();
-  // Destroy the flow even though we never fed any bytes. The engine still
-  // allocated per-flow state in qmdpi_flow_create(); this releases it.
-  if (flow_ != nullptr) {
-    releaseFlow(/*from_verdict_path=*/true);
-  }
   setVerdict(config_->nonWebCluster(), /*is_web=*/false);
   if (cb_ != nullptr) {
     cb_->continueFilterChain(true);
@@ -315,7 +264,7 @@ void Filter::onSilenceTimeout() {
 }
 
 void Filter::setVerdict(absl::string_view cluster_name, bool is_web) {
-  if (verdict_set_) return;  // Idempotent; defensive against double-fire.
+  if (verdict_set_) return;
   verdict_set_ = true;
 
   if (is_web) {
@@ -332,47 +281,13 @@ void Filter::setVerdict(absl::string_view cluster_name, bool is_web) {
       StreamInfo::FilterState::LifeSpan::Connection);
 }
 
-void Filter::releaseFlow(bool from_verdict_path, qmdpi_result** out_result) {
-  if (flow_ == nullptr) return;
-  auto& worker_obj = config_->engine().workerForThisThread();
-  qmdpi_worker* worker = worker_obj.raw();
-  if (worker == nullptr) {
-    // Worker is gone (engine teardown raced) — leak the flow rather than
-    // call into a dead engine. Increment engine_error for visibility.
-    config_->stats().engine_error_.inc();
-    flow_ = nullptr;
-    config_->stats().flows_active_.dec();
-    return;
-  }
-  qmdpi_result* sink = nullptr;
-  qmdpi_result** target = (out_result != nullptr) ? out_result : &sink;
-  int rc = qmdpi_flow_destroy(worker, flow_, target);
-  if (rc != 0) {
-    // Per qmdpi.h: "QMDPI_PROCESS_MORE if one or more TCP Segments of the
-    // flow are still present in the reassembly queue". Phase 1 doesn't feed
-    // more bytes anyway, so QMDPI_PROCESS_MORE is harmless — log at debug.
-    ENVOY_LOG(debug, "qosmos_dpi: qmdpi_flow_destroy returned {}", rc);
-  }
-  flow_ = nullptr;
-  config_->stats().flows_active_.dec();
-  if (from_verdict_path) {
-    config_->stats().flows_released_at_verdict_.inc();
-  } else {
-    config_->stats().flows_released_at_close_.inc();
-  }
-}
-
 void Filter::onClose() {
-  // Belt-and-braces: if the connection closed before any verdict path ran
-  // (e.g. client SYN-then-RST), destroy the flow now. In the happy path
-  // this is a no-op because flow_ was already nulled by classifyOnFirstPdu
-  // or onSilenceTimeout.
   if (silence_timer_ != nullptr) {
     silence_timer_->disableTimer();
   }
-  if (flow_ != nullptr) {
-    releaseFlow(/*from_verdict_path=*/false);
-  }
+  // ~classifier_ in ~Filter handles the actual qmdpi_flow_destroy via RAII.
+  // Nothing else to do here; recordClassifierDestruction in ~Filter
+  // updates the released-at-close stat.
 }
 
 }  // namespace QosmosDpi

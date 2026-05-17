@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -14,14 +15,22 @@
 
 #include "envoy/extensions/filters/listener/qosmos_dpi/v3/qosmos_dpi.pb.h"
 
-extern "C" {
-#include "qmdpi.h"
-}
-
 namespace Envoy {
 namespace Extensions {
 namespace ListenerFilters {
 namespace QosmosDpi {
+
+// Factory function the Filter uses to obtain a per-connection classifier.
+// In production this delegates to QosmosEngine::makeClassifier(). Tests
+// substitute a lambda that returns a MockQosmosClassifier.
+//
+// is_v6 selects IPv4 vs IPv6 layout. src_ip/dst_ip point to the address
+// bytes (4 or 16 depending on is_v6). Ports are network byte order.
+using ClassifierFactory =
+    std::function<QosmosClassifierPtr(bool is_v6, const void* src_ip,
+                                       uint16_t src_port_nbo,
+                                       const void* dst_ip,
+                                       uint16_t dst_port_nbo)>;
 
 // All counter / histogram stats for the qosmos_dpi listener filter.
 //
@@ -58,8 +67,10 @@ struct QosmosDpiStats {
 // Config for the qosmos_dpi listener filter. One Config per listener; the
 // filter Factory clones it per-connection. Holds:
 //   - a shared_ptr to the process-wide QosmosEngine (Singleton::Instance)
-//   - resolved proto-config knobs: cluster names, silence_timeout,
-//     max_inspect_bytes, default_tenant_id, close_on_engine_error
+//   - the protocol-table reference (cascade lookup table)
+//   - the classifier factory (production: QosmosEngine::makeClassifier;
+//     tests: lambda returning MockQosmosClassifier)
+//   - resolved proto-config knobs
 //   - the stats handle (shared by all filter instances on this listener)
 class Config {
 public:
@@ -69,7 +80,16 @@ public:
   Config(const ProtoConfig& proto, QosmosEngineSharedPtr engine,
          Stats::Scope& scope);
 
-  QosmosEngine& engine() { return *engine_; }
+  // Test-only constructor: inject a mock classifier factory and bypass
+  // QosmosEngine entirely. The protocol table is provided directly.
+  Config(const ProtoConfig& proto, ClassifierFactory factory,
+         std::shared_ptr<ProtocolTable> table, Stats::Scope& scope);
+
+  // The cascade lookup table. In production the engine owns it; in tests
+  // we override via the second constructor. Always non-null after Config
+  // construction (the constructors enforce this).
+  const ProtocolTable& table() const;
+  const ClassifierFactory& classifierFactory() const { return classifier_factory_; }
 
   const std::string& webCluster() const { return web_cluster_; }
   const std::string& nonWebCluster() const { return non_web_cluster_; }
@@ -81,7 +101,13 @@ public:
   QosmosDpiStats& stats() { return stats_; }
 
 private:
+  // engine_ is non-null in production; null in tests (when the second
+  // constructor is used). Owning the shared_ptr keeps the engine alive
+  // for as long as any Config (and therefore listener) references it.
   QosmosEngineSharedPtr engine_;
+  std::shared_ptr<ProtocolTable> table_;
+  ClassifierFactory classifier_factory_;
+
   std::string web_cluster_;
   std::string non_web_cluster_;
   std::chrono::milliseconds silence_timeout_;
@@ -96,16 +122,21 @@ using ConfigSharedPtr = std::shared_ptr<Config>;
 // The listener filter itself. One instance per accepted connection.
 //
 // Lifecycle (matches docs/qosmos-dpi-integration-plan.md §1, §7.4):
-//   onAccept   →  qmdpi_flow_create(5-tuple) + arm 200ms silence timer
-//   onData     →  qmdpi_worker_pdu_set + qmdpi_worker_process(intermediate)
-//                 →  ALWAYS qmdpi_flow_destroy(&final_result)   (releaseFlow)
-//                 →  setVerdict(web | non-web)  via PerConnectionCluster
-//                 →  return Continue   (filter is done)
-//   silence    →  setVerdict(non_web)  + continueFilterChain(true)
-//                 (server-greets-first FTP/SMTP)
-//   onClose    →  releaseFlow() if still alive (belt-and-braces)
+//   onAccept   →  config_->classifierFactory()(...) → owns qmdpi_flow*
+//                 + arm 200ms silence timer
+//   onData     →  classifier_->classifyFirstPdu() returns
+//                 {intermediate_path, final_path}; classifier internally
+//                 ALWAYS calls qmdpi_flow_destroy.
+//                 cascade(intermediate) || cascade(final) || non_web
+//                 setVerdict() via PerConnectionCluster
+//                 return Continue (filter is done)
+//   silence    →  setVerdict(non_web), continueFilterChain(true).
+//                 ~classifier_ destroys the unused flow.
+//   onClose    →  ~classifier_ destroys the flow if still alive
+//                 (belt-and-braces; rare — connection closed before
+//                 first byte AND before silence_timeout fired).
 //
-// Default verdict on any inconclusive / null / error path is non-web.
+// Default verdict on any inconclusive / null / error path is non-web (CFW).
 class Filter : public Network::ListenerFilter,
                Logger::Loggable<Logger::Id::filter> {
 public:
@@ -119,40 +150,25 @@ public:
   void onClose() override;
 
 private:
-  // Called from onData once we have at least one PDU. Runs:
-  //   qmdpi_worker_pdu_set + qmdpi_worker_process → cascade → if no verdict yet,
-  //   qmdpi_flow_destroy → cascade(final_result) → setVerdict.
-  // Returns Continue when verdict is finalised, StopIteration when waiting
-  // for more bytes (only when we haven't reached max_inspect_bytes yet).
-  Network::FilterStatus classifyOnFirstPdu(
-      const Buffer::ConstRawSlice& slice);
-
-  // Silence-timer callback. Invoked from the dispatcher when no client
-  // bytes arrived within the silence_timeout window. Defaults verdict
-  // to non_web (CFW for FTP/SMTP server-greets-first) and releases the
-  // filter chain.
+  // Silence-timer callback. Invoked when no client bytes arrived within
+  // silence_timeout. Defaults verdict to non_web and releases the chain.
   void onSilenceTimeout();
 
   // Write PerConnectionCluster into FilterState. Called exactly once per
-  // connection from a verdict-finalising path. After this, tcp_proxy will
-  // pick `cluster_name` as the upstream when the filter chain continues.
+  // connection from a verdict-finalising path.
   void setVerdict(absl::string_view cluster_name, bool is_web);
 
-  // Destroy the qmdpi_flow* and release engine-side state. Idempotent —
-  // sets flow_ = nullptr after destruction. Called from every verdict
-  // path AND from onClose belt-and-braces. The two paths increment
-  // different counters so we can verify the invariant
-  // `flows_released_at_verdict + flows_released_at_close == flows_created`.
-  // `from_verdict_path` true ⇒ increment flows_released_at_verdict.
-  // false ⇒ increment flows_released_at_close.
-  void releaseFlow(bool from_verdict_path, qmdpi_result** out_result = nullptr);
+  // Increment the appropriate flow-released-* counter based on whether
+  // the classifier was destroyed via the verdict path (classifyFirstPdu
+  // ran) or the on-close belt-and-braces path. Called from ~Filter.
+  void recordClassifierDestruction();
 
   ConfigSharedPtr config_;
   Network::ListenerFilterCallbacks* cb_{};
-  qmdpi_flow* flow_{};
+  QosmosClassifierPtr classifier_;
   Event::TimerPtr silence_timer_;
-  size_t bytes_inspected_{0};
   bool verdict_set_{false};
+  bool classify_invoked_{false};   // true once classifyFirstPdu has run.
 };
 
 }  // namespace QosmosDpi
