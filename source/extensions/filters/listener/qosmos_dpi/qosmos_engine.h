@@ -18,6 +18,48 @@ namespace Extensions {
 namespace ListenerFilters {
 namespace QosmosDpi {
 
+// Result of a single first-PDU classification round: the engine's
+// intermediate path (from qmdpi_worker_process) and the final path
+// (from qmdpi_flow_destroy out-param). Either may be empty.
+struct ClassifyResult {
+  std::string intermediate_path;
+  std::string final_path;
+  bool engine_error{false};   // true if qmdpi_worker_pdu_set or
+                              // qmdpi_worker_process returned non-zero.
+};
+
+// Per-connection classification transaction. Owns a qmdpi_flow* via
+// RAII: created at construction time (or nullptr on failure), destroyed
+// either by `classifyFirstPdu()` (the verdict path) or by `~QosmosClassifier`
+// (the silence-timeout / on-close path). Either way, qmdpi_flow_destroy
+// is called exactly once per successfully-created flow.
+//
+// Filter holds a `std::unique_ptr<QosmosClassifier>` per accepted
+// connection. Tests substitute a MockQosmosClassifier that returns
+// canned ClassifyResult instances without touching the real Qosmos engine.
+class QosmosClassifier {
+public:
+  virtual ~QosmosClassifier() = default;
+
+  // Whether the underlying qmdpi_flow* was created successfully and is
+  // still alive (i.e. classifyFirstPdu hasn't been called yet AND the
+  // constructor didn't fail). False ⇒ the connection should fail-safe
+  // to non-web.
+  virtual bool flowAlive() const PURE;
+
+  // Single-shot classify. Feeds `bytes`/`len` to qmdpi_worker_pdu_set,
+  // runs qmdpi_worker_process to get the intermediate path, then
+  // UNCONDITIONALLY calls qmdpi_flow_destroy to get the final path
+  // and release engine-side state. After this returns, flowAlive()
+  // returns false and subsequent calls are no-ops returning empty
+  // ClassifyResult{}.
+  virtual ClassifyResult classifyFirstPdu(const void* bytes, int len,
+                                          int direction,
+                                          int tenant_id) PURE;
+};
+
+using QosmosClassifierPtr = std::unique_ptr<QosmosClassifier>;
+
 // Per-Envoy-worker Qosmos handle. Holds a `qmdpi_worker*` whose lifetime
 // matches its enclosing Envoy worker thread (one ThreadLocal slot entry per
 // worker). Created via `qmdpi_worker_create(engine)` on each worker thread,
@@ -77,14 +119,24 @@ public:
 
   ~QosmosEngine() override;
 
-  qmdpi_engine* rawEngine() const { return engine_; }
-  qmdpi_bundle* rawBundle() const { return bundle_; }
   const ProtocolTable& table() const { return *table_; }
 
   // Returns the QosmosWorker bound to the calling Envoy worker thread.
   // Must be called from a worker thread (i.e. inside an Envoy filter
   // callback) — the underlying TypedSlot<>::get() asserts this.
   QosmosWorker& workerForThisThread();
+
+  // Factory: build a QosmosClassifier for one connection. The classifier
+  // calls qmdpi_flow_create internally during construction. Returns nullptr
+  // if the engine isn't ready (e.g. construction failed earlier and we're
+  // operating in fail-safe mode); the caller treats nullptr as engine_error.
+  //
+  // src/dst args are network-byte-order. `is_v6` selects between IPv4 (uses
+  // the lower 4 bytes of `src`/`dst`) and IPv6 (uses all 16 bytes).
+  QosmosClassifierPtr makeClassifier(bool is_v6, const void* src_ip,
+                                      uint16_t src_port_nbo,
+                                      const void* dst_ip,
+                                      uint16_t dst_port_nbo);
 
 private:
   // Build the engine_config string that gets passed to qmdpi_engine_create.

@@ -1,11 +1,17 @@
 #include "source/extensions/filters/listener/qosmos_dpi/qosmos_engine.h"
 
+#include <sys/time.h>
+
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
 
 #include "absl/strings/str_format.h"
+
+extern "C" {
+#include "dpi/protodef.h"  // Q_PROTO_IP, Q_PROTO_IP6, Q_PROTO_TCP
+}
 
 namespace Envoy {
 namespace Extensions {
@@ -137,6 +143,127 @@ QosmosWorker& QosmosEngine::workerForThisThread() {
   // a runOnAllThreads() will trip the underlying assert — that's the
   // intended Envoy contract for ThreadLocal.
   return worker_slot_->get().ref();
+}
+
+// ─────────── Real Qosmos classifier implementation ───────────
+//
+// Owns a qmdpi_flow* via RAII. classifyFirstPdu consumes it; ~RealClassifier
+// destroys it if classify never ran (silence-timeout / on-close path).
+namespace {
+
+// Render the qmdpi_path object as a dotted string. Mirrors
+// dataplane/libs/qosmos_dpi/src/QosmosDpi.cpp:372 (qmdpi_data_path_to_buffer).
+std::string pathToString(qmdpi_bundle* bundle, const qmdpi_path* path) {
+  if (path == nullptr || bundle == nullptr) return {};
+  char buffer[512];
+  int rc = qmdpi_data_path_to_buffer(bundle, buffer, sizeof(buffer), path);
+  if (rc != 0) return {};
+  return std::string(buffer);
+}
+
+class RealQosmosClassifier : public QosmosClassifier,
+                              Logger::Loggable<Logger::Id::filter> {
+public:
+  RealQosmosClassifier(qmdpi_worker* worker, qmdpi_bundle* bundle,
+                        qmdpi_flow* flow)
+      : worker_(worker), bundle_(bundle), flow_(flow) {}
+
+  ~RealQosmosClassifier() override {
+    // RAII: if classifyFirstPdu never ran (e.g. silence timeout, early
+    // close), destroy the flow here. qmdpi_flow_destroy is the only way
+    // to release engine-side per-flow state in stream mode.
+    if (flow_ != nullptr) {
+      qmdpi_result* sink = nullptr;
+      int rc = qmdpi_flow_destroy(worker_, flow_, &sink);
+      if (rc != 0) {
+        ENVOY_LOG(debug, "qosmos_dpi: ~RealQosmosClassifier: "
+                          "qmdpi_flow_destroy returned {}", rc);
+      }
+      flow_ = nullptr;
+    }
+  }
+
+  bool flowAlive() const override { return flow_ != nullptr; }
+
+  ClassifyResult classifyFirstPdu(const void* bytes, int len, int direction,
+                                   int tenant_id) override {
+    ClassifyResult result;
+    if (flow_ == nullptr || worker_ == nullptr) {
+      result.engine_error = true;
+      return result;
+    }
+
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+
+    int rc = qmdpi_worker_pdu_set(worker_, bytes, len, &tv,
+                                   /*first_header=*/0, direction, tenant_id);
+    if (rc != 0) {
+      ENVOY_LOG(debug, "qosmos_dpi: qmdpi_worker_pdu_set returned {}", rc);
+      result.engine_error = true;
+      // Continue — flow_destroy below may still produce a useful final.
+    }
+
+    qmdpi_result* intermediate = nullptr;
+    rc = qmdpi_worker_process(worker_, /*flow=*/nullptr, &intermediate);
+    if (rc != 0) {
+      ENVOY_LOG(debug, "qosmos_dpi: qmdpi_worker_process returned {}", rc);
+      result.engine_error = true;
+    }
+    if (intermediate != nullptr) {
+      qmdpi_path* p = qmdpi_result_path_get(intermediate);
+      result.intermediate_path = pathToString(bundle_, p);
+    }
+
+    // ALWAYS qmdpi_flow_destroy — see plan §1, §7.4. Whether the
+    // intermediate was conclusive or not, the per-flow state is no
+    // longer needed (we will not feed more bytes). The destroy out-param
+    // is the engine's best-guess final result.
+    qmdpi_result* final_result = nullptr;
+    rc = qmdpi_flow_destroy(worker_, flow_, &final_result);
+    if (rc != 0) {
+      ENVOY_LOG(debug, "qosmos_dpi: qmdpi_flow_destroy returned {}", rc);
+    }
+    flow_ = nullptr;
+    if (final_result != nullptr) {
+      qmdpi_path* p = qmdpi_result_path_get(final_result);
+      result.final_path = pathToString(bundle_, p);
+    }
+
+    return result;
+  }
+
+private:
+  qmdpi_worker* worker_;
+  qmdpi_bundle* bundle_;
+  qmdpi_flow* flow_;
+};
+
+}  // namespace
+
+QosmosClassifierPtr QosmosEngine::makeClassifier(bool is_v6, const void* src_ip,
+                                                  uint16_t src_port_nbo,
+                                                  const void* dst_ip,
+                                                  uint16_t dst_port_nbo) {
+  if (engine_ == nullptr || bundle_ == nullptr) {
+    return nullptr;
+  }
+  auto& worker_obj = workerForThisThread();
+  qmdpi_worker* worker = worker_obj.raw();
+  if (worker == nullptr) {
+    return nullptr;
+  }
+
+  const int l3 = is_v6 ? Q_PROTO_IP6 : Q_PROTO_IP;
+  qmdpi_flow* flow = qmdpi_flow_create(worker, l3, Q_PROTO_TCP,
+                                        src_ip, &src_port_nbo,
+                                        dst_ip, &dst_port_nbo);
+  if (flow == nullptr) {
+    ENVOY_LOG(warn, "qosmos_dpi: qmdpi_flow_create returned NULL (errno={}: {})",
+              errno, std::strerror(errno));
+    return nullptr;
+  }
+  return std::make_unique<RealQosmosClassifier>(worker, bundle_, flow);
 }
 
 }  // namespace QosmosDpi
