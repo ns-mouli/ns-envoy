@@ -21,9 +21,14 @@ namespace QosmosDpi {
 // Result of a single first-PDU classification round: the engine's
 // intermediate path (from qmdpi_worker_process) and the final path
 // (from qmdpi_flow_destroy out-param). Either may be empty.
+//
+// hooks carries any extracted attributes the cascade consults. As of
+// 2026-05-18 we extract only ssl:alpn; future extensions can populate
+// additional keys without changing the cascade interface.
 struct ClassifyResult {
   std::string intermediate_path;
   std::string final_path;
+  Hooks hooks;
   bool engine_error{false};   // true if qmdpi_worker_pdu_set or
                               // qmdpi_worker_process returned non-zero.
 };
@@ -149,6 +154,14 @@ private:
   qmdpi_bundle* bundle_{};
   std::unique_ptr<ProtocolTable> table_;
   ThreadLocal::TypedSlotPtr<QosmosWorker> worker_slot_;
+
+  // Cascade rules 0/1 consume `ssl:alpn`. We register that attribute at
+  // init time and cache its (proto_id, attr_id) integer pair so the
+  // per-classify result-iteration can match it without string lookups.
+  // Negative values ⇒ registration failed (cascade will run without ALPN
+  // hooks; rules 0/1 won't fire; behaviour is conservative).
+  int ssl_proto_id_{-1};
+  int alpn_attr_id_{-1};
 };
 
 using QosmosEngineSharedPtr = std::shared_ptr<QosmosEngine>;
