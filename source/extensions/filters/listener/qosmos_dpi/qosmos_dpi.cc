@@ -225,20 +225,23 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
   }
 
   // Run the cascade: intermediate first, then final on inconclusive.
-  // Without ssl:alpn hooks, rules 0/1 don't fire (TODO: wire hook
-  // extraction in a follow-up; cascade falls back to rule 2/3/4).
-  Hooks empty_hooks;
+  // The classifier extracts ssl:alpn from qmdpi_result for us so cascade
+  // rules 0 (non-web ALPN beats everything) and 1 (transport-token +
+  // HTTP ALPN ⇒ web) can fire.
   std::optional<bool> verdict;
+  const auto alpn_it = cr.hooks.find("ssl:alpn");
+  const std::string alpn_str =
+      alpn_it != cr.hooks.end() ? alpn_it->second : std::string{};
   if (!cr.intermediate_path.empty()) {
-    verdict = config_->table().isWeb(cr.intermediate_path, empty_hooks);
-    ENVOY_LOG(debug, "qosmos_dpi: intermediate path='{}' verdict={}",
-              cr.intermediate_path,
+    verdict = config_->table().isWeb(cr.intermediate_path, cr.hooks);
+    ENVOY_LOG(debug, "qosmos_dpi: intermediate path='{}' alpn='{}' verdict={}",
+              cr.intermediate_path, alpn_str,
               verdict.has_value() ? (*verdict ? "web" : "non-web") : "null");
   }
   if (!verdict.has_value() && !cr.final_path.empty()) {
-    verdict = config_->table().isWeb(cr.final_path, empty_hooks);
-    ENVOY_LOG(debug, "qosmos_dpi: final-after-destroy path='{}' verdict={}",
-              cr.final_path,
+    verdict = config_->table().isWeb(cr.final_path, cr.hooks);
+    ENVOY_LOG(debug, "qosmos_dpi: final-after-destroy path='{}' alpn='{}' verdict={}",
+              cr.final_path, alpn_str,
               verdict.has_value() ? (*verdict ? "web" : "non-web") : "null");
   }
 

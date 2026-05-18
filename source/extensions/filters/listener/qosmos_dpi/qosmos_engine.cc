@@ -101,6 +101,48 @@ QosmosEngine::QosmosEngine(const std::string& engine_config,
         absl::StrFormat("qosmos_dpi: qmdpi_bundle_activate failed (rc=%d)", rc));
   }
 
+  // Enable all signatures. Without this, every protocol is disabled — the
+  // engine produces empty paths and qmdpi_bundle_attr_register fails with
+  // -1. Mirrors the licensed-SDK example
+  // (src/examples/attribute_extraction/main.c:161). Reference:
+  // qosmos-poc pcap-analyzer also calls this.
+  if (int rc = qmdpi_bundle_signature_enable_all(bundle_); rc != 0) {
+    qmdpi_bundle_destroy(bundle_);
+    qmdpi_engine_destroy(engine_);
+    bundle_ = nullptr;
+    engine_ = nullptr;
+    throw EnvoyException(absl::StrFormat(
+        "qosmos_dpi: qmdpi_bundle_signature_enable_all failed (rc=%d)", rc));
+  }
+
+  // Register ssl:alpn for extraction. Cascade rules 0 (non-web ALPN
+  // beats everything) and 1 (transport-token + HTTP ALPN ⇒ web) consume
+  // it. Failure here is non-fatal — we log and proceed with ssl_proto_id_
+  // staying at -1, which makes the per-classify hook extraction a no-op.
+  // Cascade then runs with no ALPN signal: conservative — more flows go
+  // to non-web/CFW, but no incorrect web verdicts.
+  if (int rc = qmdpi_bundle_attr_register(bundle_, "ssl", "alpn"); rc != 0) {
+    ENVOY_LOG(warn, "qosmos_dpi: qmdpi_bundle_attr_register(ssl, alpn) "
+                     "returned {} — ALPN cascade rules will not fire", rc);
+  } else {
+    // Cache the integer (proto_id, attr_id) pair for fast match in the
+    // per-classify result iterator.
+    qmdpi_signature* ssl_sig = qmdpi_bundle_signature_get_byname(bundle_, "ssl");
+    qmdpi_attr* alpn_attr =
+        qmdpi_bundle_attr_get_byname(bundle_, "ssl", "alpn");
+    if (ssl_sig != nullptr && alpn_attr != nullptr) {
+      ssl_proto_id_ = qmdpi_signature_id_get(ssl_sig);
+      alpn_attr_id_ = qmdpi_attr_id_get(alpn_attr);
+      ENVOY_LOG(info, "qosmos_dpi: registered ssl:alpn extraction "
+                       "(proto_id={}, attr_id={})", ssl_proto_id_, alpn_attr_id_);
+    } else {
+      ENVOY_LOG(warn, "qosmos_dpi: could not resolve ssl:alpn ids "
+                       "(ssl_sig={}, alpn_attr={}) — ALPN cascade rules "
+                       "will not fire",
+                fmt::ptr(ssl_sig), fmt::ptr(alpn_attr));
+    }
+  }
+
   // 3. Protocol table (CSV-derived JSON). Loaded right after bundle activate
   //    so that any hot-path lookup never has to NULL-check it.
   ENVOY_LOG(info, "qosmos_dpi: loading protocol table from '{}'", table_path);
@@ -177,9 +219,13 @@ std::string pathToString(qmdpi_bundle* bundle, const qmdpi_path* path) {
 class RealQosmosClassifier : public QosmosClassifier,
                               Logger::Loggable<Logger::Id::filter> {
 public:
+  // ssl_proto_id / alpn_attr_id of -1 disable hook extraction (cascade
+  // runs with empty Hooks; rules 0/1 don't fire). See QosmosEngine ctor
+  // for why those might be -1.
   RealQosmosClassifier(qmdpi_worker* worker, qmdpi_bundle* bundle,
-                        qmdpi_flow* flow)
-      : worker_(worker), bundle_(bundle), flow_(flow) {}
+                        qmdpi_flow* flow, int ssl_proto_id, int alpn_attr_id)
+      : worker_(worker), bundle_(bundle), flow_(flow),
+        ssl_proto_id_(ssl_proto_id), alpn_attr_id_(alpn_attr_id) {}
 
   ~RealQosmosClassifier() override {
     // RAII: if classifyFirstPdu never ran (e.g. silence timeout, early
@@ -226,6 +272,10 @@ public:
     if (intermediate != nullptr) {
       qmdpi_path* p = qmdpi_result_path_get(intermediate);
       result.intermediate_path = pathToString(bundle_, p);
+      // Extract ssl:alpn from intermediate result. The TLS ClientHello
+      // is the very first client byte stream, so ALPN is typically
+      // available on the intermediate path already — before flow_destroy.
+      extractAlpn(intermediate, result.hooks);
     }
 
     // ALWAYS qmdpi_flow_destroy — see plan §1, §7.4. Whether the
@@ -241,15 +291,53 @@ public:
     if (final_result != nullptr) {
       qmdpi_path* p = qmdpi_result_path_get(final_result);
       result.final_path = pathToString(bundle_, p);
+      // Re-extract ssl:alpn from final result IF the intermediate didn't
+      // produce one (e.g. flow that pinned to ssl only after destroy).
+      // We don't overwrite — first-seen wins.
+      if (result.hooks.find("ssl:alpn") == result.hooks.end()) {
+        extractAlpn(final_result, result.hooks);
+      }
     }
 
     return result;
   }
 
 private:
+  // Walk qmdpi_result_attr_getnext on `result` and pluck out any
+  // ssl:alpn values, comma-joined into hooks["ssl:alpn"]. ALPN can have
+  // multiple registered values per flow (the client's full preference
+  // list); we join them with ", " to match the qosmos-poc cascade
+  // (run_tests.py:340 splits on ',' and trims).
+  void extractAlpn(qmdpi_result* result, Hooks& hooks) const {
+    if (result == nullptr || ssl_proto_id_ < 0 || alpn_attr_id_ < 0) {
+      return;
+    }
+    int proto_id = 0, attr_id = 0, attr_flags = 0;
+    int attr_len = 0;
+    const char* attr_value = nullptr;
+    std::string joined;
+    while (qmdpi_result_attr_getnext(result, &proto_id, &attr_id,
+                                      &attr_value, &attr_len,
+                                      &attr_flags) == 0) {
+      if (proto_id != ssl_proto_id_ || attr_id != alpn_attr_id_) {
+        continue;
+      }
+      if (attr_value == nullptr || attr_len <= 0) {
+        continue;
+      }
+      if (!joined.empty()) joined.append(", ");
+      joined.append(attr_value, static_cast<size_t>(attr_len));
+    }
+    if (!joined.empty()) {
+      hooks["ssl:alpn"] = std::move(joined);
+    }
+  }
+
   qmdpi_worker* worker_;
   qmdpi_bundle* bundle_;
   qmdpi_flow* flow_;
+  int ssl_proto_id_;
+  int alpn_attr_id_;
 };
 
 }  // namespace
@@ -276,7 +364,8 @@ QosmosClassifierPtr QosmosEngine::makeClassifier(bool is_v6, const void* src_ip,
               errno, std::strerror(errno));
     return nullptr;
   }
-  return std::make_unique<RealQosmosClassifier>(worker, bundle_, flow);
+  return std::make_unique<RealQosmosClassifier>(worker, bundle_, flow,
+                                                  ssl_proto_id_, alpn_attr_id_);
 }
 
 }  // namespace QosmosDpi

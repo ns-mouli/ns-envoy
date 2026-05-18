@@ -236,6 +236,60 @@ TEST_F(QosmosDpiFilterTest, BothPathsEmptyForcesCfw) {
   EXPECT_EQ(config_->stats().inconclusive_forced_cfw_.value(), 1);
 }
 
+// ─────────── ssl:alpn hook-driven verdicts ───────────
+//
+// Cascade rules 0 and 1 require the classifier to populate
+// ClassifyResult.hooks["ssl:alpn"]. Rule 0 (non-web ALPN beats
+// everything) and rule 1 (transport-token + HTTP ALPN ⇒ web) only fire
+// when ALPN is present.
+
+TEST_F(QosmosDpiFilterTest, AlpnFtpForcesNonWebViaRule0) {
+  next_factory_result_.intermediate_path = "base.ip.tcp.ssl.unknown";
+  next_factory_result_.hooks["ssl:alpn"] = "ftp";
+  runCycle("\x16\x03\x01...");
+  EXPECT_EQ(verdictCluster(), "cfw_cluster");
+  EXPECT_EQ(config_->stats().non_web_classified_.value(), 1);
+  EXPECT_EQ(config_->stats().web_classified_.value(), 0);
+}
+
+TEST_F(QosmosDpiFilterTest, AlpnH2OnSslUnknownTriggersRule1Web) {
+  next_factory_result_.intermediate_path = "base.ip.tcp.ssl.unknown";
+  next_factory_result_.hooks["ssl:alpn"] = "h2";
+  runCycle("\x16\x03\x01...");
+  EXPECT_EQ(verdictCluster(), "web_cluster");
+  EXPECT_EQ(config_->stats().web_classified_.value(), 1);
+}
+
+TEST_F(QosmosDpiFilterTest, AlpnHttp1OnAmazonAwsTriggersRule1Web) {
+  // Hosting-token last segment: rule 2 deliberately skips (CSV
+  // amazon_aws=true is aggregate, individual flows may be non-web).
+  // Rule 1 with HTTP ALPN promotes to web on positive client evidence.
+  next_factory_result_.intermediate_path = "base.ip.tcp.ssl.amazon_aws";
+  next_factory_result_.hooks["ssl:alpn"] = "http/1.1";
+  runCycle("\x16\x03\x01...");
+  EXPECT_EQ(verdictCluster(), "web_cluster");
+  EXPECT_EQ(config_->stats().web_classified_.value(), 1);
+}
+
+TEST_F(QosmosDpiFilterTest, AlpnFtpDataMatchesNonWebPrefix) {
+  // Non-web ALPN matching is prefix+dash (so ftp-data matches ftp).
+  next_factory_result_.intermediate_path = "base.ip.tcp.ssl.unknown";
+  next_factory_result_.hooks["ssl:alpn"] = "ftp-data";
+  runCycle("\x16\x03\x01...");
+  EXPECT_EQ(verdictCluster(), "cfw_cluster");
+  EXPECT_EQ(config_->stats().non_web_classified_.value(), 1);
+}
+
+TEST_F(QosmosDpiFilterTest, AlpnListWithFtpEntryStillTriggersRule0) {
+  // ALPN can be a comma-separated list (client preference order).
+  // Any non-web entry beats everything.
+  next_factory_result_.intermediate_path = "base.ip.tcp.ssl.amazon_aws";
+  next_factory_result_.hooks["ssl:alpn"] = "h2, ftp";
+  runCycle("\x16\x03\x01...");
+  EXPECT_EQ(verdictCluster(), "cfw_cluster");
+  EXPECT_EQ(config_->stats().non_web_classified_.value(), 1);
+}
+
 // ─────────── Lifecycle invariants ───────────
 
 TEST_F(QosmosDpiFilterTest, ClassifyFirstPduIsCalledExactlyOnce) {
