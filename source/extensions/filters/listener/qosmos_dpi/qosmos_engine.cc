@@ -47,11 +47,20 @@ std::string QosmosEngine::resolveEngineConfig(const std::string& user_supplied,
   if (!user_supplied.empty()) {
     return user_supplied;
   }
-  // Stream-mode default. Mirrors dataplane/libs/qosmos_dpi/src/QosmosDpi.cpp:52.
-  // first_header=0 (handled per-PDU in the filter, not at engine create) +
-  // injection_mode=stream + nb_workers must match the Envoy worker count
-  // so the Qosmos engine's internal lock-free fan-out has the right shape.
-  return absl::StrFormat("injection_mode=stream;nb_workers=%u", nb_workers);
+  // Stream-mode default. Mirrors dataplane/libs/qosmos_dpi/src/QosmosDpi.cpp:52
+  // and the licensed-SDK example
+  // (src/examples/attribute_extraction/main.c:131):
+  //   injection_mode=stream
+  //   nb_workers=N+1 — Envoy worker count plus one slack slot. Empirically
+  //                    qmdpi_worker_create returns NULL when the count
+  //                    matches exactly (one slot may be reserved for the
+  //                    engine's own use); bumping by 1 avoids the race.
+  //   nb_flows=10000 — required for stream-mode flow allocation. The SDK
+  //                    example uses 1000 for packet mode; we bump to 10K
+  //                    because envoy connection rates can exceed packet-
+  //                    mode demos.
+  return absl::StrFormat("injection_mode=stream;nb_workers=%u;nb_flows=10000",
+                          nb_workers + 1);
 }
 
 QosmosEngine::QosmosEngine(const std::string& engine_config,
@@ -264,7 +273,12 @@ public:
     }
 
     qmdpi_result* intermediate = nullptr;
-    rc = qmdpi_worker_process(worker_, /*flow=*/nullptr, &intermediate);
+    // STREAM mode: the flow handle MUST be passed to qmdpi_worker_process
+    // (see SDK src/examples/stream_injection/main.c:788). Passing NULL is
+    // for packet mode where the engine looks up the flow from the L3/L4
+    // headers we don't supply. We did supply a flow via qmdpi_flow_create,
+    // so it goes here. Without this the engine returns -1 with no errno.
+    rc = qmdpi_worker_process(worker_, flow_, &intermediate);
     if (rc != 0) {
       ENVOY_LOG(debug, "qosmos_dpi: qmdpi_worker_process returned {}", rc);
       result.engine_error = true;
@@ -276,6 +290,12 @@ public:
       // is the very first client byte stream, so ALPN is typically
       // available on the intermediate path already — before flow_destroy.
       extractAlpn(intermediate, result.hooks);
+      ENVOY_LOG(debug, "qosmos_dpi: post-process result={} path_ptr={} "
+                        "rendered_path='{}' rc={}",
+                fmt::ptr(intermediate), fmt::ptr(p),
+                result.intermediate_path, rc);
+    } else {
+      ENVOY_LOG(debug, "qosmos_dpi: post-process result is NULL (rc={})", rc);
     }
 
     // ALWAYS qmdpi_flow_destroy — see plan §1, §7.4. Whether the
