@@ -39,8 +39,12 @@ message QosmosDpi {
   // concurrency.
   string engine_config_path = 1;
 
-  // Path to the Qosmos protocol bundle (``.qmdb``). Required.
-  string protocol_bundle_path = 2 [(validate.rules).string = {min_len: 1}];
+  // Path to a Qosmos protocol bundle shared library (``libqmbundle.so``).
+  // Optional. When empty, the bundle is taken from the libqmbundle library
+  // statically linked into the envoy binary (the standard build). Set this
+  // field only if you want envoy to dynamically load a bundle file at
+  // runtime instead of using the linked-in one.
+  string protocol_bundle_path = 2;
 
   // Path to the slim JSON derived from ``Qosmos_Protocol.csv`` plus the five
   // cascade token sets (transport_tokens, hosting_tokens, http_alpn_prefixes,

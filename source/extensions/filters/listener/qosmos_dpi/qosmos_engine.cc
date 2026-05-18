@@ -70,14 +70,27 @@ QosmosEngine::QosmosEngine(const std::string& engine_config,
   }
 
   // 2. Bundle.
-  ENVOY_LOG(info, "qosmos_dpi: loading protocol bundle from '{}'", bundle_path);
-  bundle_ = qmdpi_bundle_create_from_file(engine_, bundle_path.c_str());
+  // Per qmdpi.h: passing NULL as filename uses the bundle library linked
+  // *into* the user application. envoy-static statically links
+  // libqmbundle.fpic.a (see ns-envoy/WORKSPACE qosmos_sdk entry), so the
+  // bundle code is already in this process — there's nothing to dlopen.
+  // The proto config field `protocol_bundle_path` can:
+  //   - be empty   ⇒ use the linked-in bundle (NULL filename)
+  //   - be a path  ⇒ dynamic load (kept for future flexibility, e.g. if
+  //                  we ever switch to a shared-library bundle)
+  const char* bundle_filename =
+      bundle_path.empty() ? nullptr : bundle_path.c_str();
+  ENVOY_LOG(info, "qosmos_dpi: loading protocol bundle ({})",
+            bundle_path.empty() ? "from statically-linked libqmbundle"
+                                 : absl::StrCat("from ", bundle_path));
+  bundle_ = qmdpi_bundle_create_from_file(engine_, bundle_filename);
   if (bundle_ == nullptr) {
     qmdpi_engine_destroy(engine_);
     engine_ = nullptr;
     throw EnvoyException(absl::StrFormat(
-        "qosmos_dpi: qmdpi_bundle_create_from_file('%s') failed (errno=%d: %s)",
-        bundle_path, errno, std::strerror(errno)));
+        "qosmos_dpi: qmdpi_bundle_create_from_file(%s) failed (errno=%d: %s)",
+        bundle_path.empty() ? "NULL" : ("'" + bundle_path + "'"),
+        errno, std::strerror(errno)));
   }
   if (int rc = qmdpi_bundle_activate(bundle_); rc != 0) {
     qmdpi_bundle_destroy(bundle_);
