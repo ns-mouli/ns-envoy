@@ -1,8 +1,11 @@
 #include "source/extensions/filters/listener/qosmos_dpi/qosmos_engine.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/time.h>
 
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -217,13 +220,63 @@ namespace {
 
 // Render the qmdpi_path object as a dotted string. Mirrors
 // dataplane/libs/qosmos_dpi/src/QosmosDpi.cpp:372 (qmdpi_data_path_to_buffer).
+//
+// API contract (qmdpi.h:2778-2780): the function returns the *written
+// length* (a positive int) on success, 0 if the path is not applicable
+// (empty path), and a negative error code on failure. Treating any
+// non-zero return as an error was an early bug — it discarded every
+// successfully rendered path.
 std::string pathToString(qmdpi_bundle* bundle, const qmdpi_path* path) {
   if (path == nullptr || bundle == nullptr) return {};
-  char buffer[512];
+  char buffer[512] = {0};
   int rc = qmdpi_data_path_to_buffer(bundle, buffer, sizeof(buffer), path);
-  if (rc != 0) return {};
+  if (rc < 0) return {};
+  // rc may be 0 (no path) or > 0 (length written). Either way the buffer
+  // is NUL-terminated by the engine; an empty buffer ⇒ empty string.
   return std::string(buffer);
 }
+
+// L3/L4 header POD layouts the Qosmos engine consumes via
+// qmdpi_worker_pdu_header_set (stream mode). Layouts mirror the licensed
+// SDK's src/include/packet_helper.h (qm_ip_hdr / qm_tcp_hdr) — the engine
+// reads these structs by absolute offset, so the on-the-wire shape (IPv4
+// / TCP fixed headers) must match exactly. We synthesise only the fields
+// the engine actually inspects: addresses + ports + next-protocol (TCP).
+// Sequence numbers, checksums, IDs, ttl, etc. are zero — stream-mode
+// protocol pinning isn't checksum-aware.
+//
+// IPv6 is intentionally not handled here: the listener can accept v6
+// flows, but pdu_header_set is skipped for them in stream mode (engine
+// continues to receive bytes; classification may still be empty — that
+// path was already fail-safe before this change). Phase-1 traffic is
+// IPv4 only.
+#pragma pack(push, 1)
+struct SynthIp4Hdr {
+  uint8_t  ihl_version;     // ihl=5, version=4 → 0x45
+  uint8_t  tos;
+  uint16_t tot_len_nbo;
+  uint16_t id;
+  uint16_t frag_off;
+  uint8_t  ttl;
+  uint8_t  protocol;        // IPPROTO_TCP = 6
+  uint16_t check;
+  uint32_t saddr_nbo;
+  uint32_t daddr_nbo;
+};
+static_assert(sizeof(SynthIp4Hdr) == 20, "IPv4 header must be 20 bytes");
+
+struct SynthTcpHdr {
+  uint16_t source_nbo;
+  uint16_t dest_nbo;
+  uint32_t seq;
+  uint32_t ack_seq;
+  uint16_t doff_flags;      // doff=5 (header length in 32-bit words)
+  uint16_t window;
+  uint16_t check;
+  uint16_t urg_ptr;
+};
+static_assert(sizeof(SynthTcpHdr) == 20, "TCP header must be 20 bytes");
+#pragma pack(pop)
 
 class RealQosmosClassifier : public QosmosClassifier,
                               Logger::Loggable<Logger::Id::filter> {
@@ -232,9 +285,39 @@ public:
   // runs with empty Hooks; rules 0/1 don't fire). See QosmosEngine ctor
   // for why those might be -1.
   RealQosmosClassifier(qmdpi_worker* worker, qmdpi_bundle* bundle,
-                        qmdpi_flow* flow, int ssl_proto_id, int alpn_attr_id)
+                        qmdpi_flow* flow, int ssl_proto_id, int alpn_attr_id,
+                        bool is_v6, const void* src_ip,
+                        uint16_t src_port_nbo, const void* dst_ip,
+                        uint16_t dst_port_nbo)
       : worker_(worker), bundle_(bundle), flow_(flow),
-        ssl_proto_id_(ssl_proto_id), alpn_attr_id_(alpn_attr_id) {}
+        ssl_proto_id_(ssl_proto_id), alpn_attr_id_(alpn_attr_id),
+        is_v4_(!is_v6) {
+    // Cache the 5-tuple into pre-baked L3/L4 header buffers so the hot
+    // path just hands their addresses to qmdpi_worker_pdu_header_set.
+    // Phase-1 only synthesises IPv4 headers (is_v4_ == false ⇒ skip
+    // header_set; behaviour reverts to the pre-hypothesis-1 path).
+    std::memset(&ip4_, 0, sizeof(ip4_));
+    std::memset(&tcp_, 0, sizeof(tcp_));
+    if (is_v4_) {
+      // version=4, ihl=5 → 0x45.
+      ip4_.ihl_version = 0x45;
+      ip4_.ttl = 64;
+      ip4_.protocol = IPPROTO_TCP;
+      // src_ip/dst_ip point at in_addr.s_addr (NBO uint32).
+      std::memcpy(&ip4_.saddr_nbo, src_ip, sizeof(ip4_.saddr_nbo));
+      std::memcpy(&ip4_.daddr_nbo, dst_ip, sizeof(ip4_.daddr_nbo));
+    }
+    (void)dst_ip;  // silence unused warning when !is_v4_
+    tcp_.source_nbo = src_port_nbo;
+    tcp_.dest_nbo = dst_port_nbo;
+    // doff=5 (20-byte header, no options). Standard TCP wire format:
+    // byte 12 = (doff<<4)|reserved = 0x50; byte 13 = flags = 0. As a
+    // little-endian uint16_t at byte offset 12, in-memory bytes
+    // [0x50, 0x00] correspond to the integer value 0x0050. The SDK
+    // qm_tcp_hdr's LE bitfield (res1:4, doff:4, ...) reads the same
+    // bytes the same way.
+    tcp_.doff_flags = 0x0050;
+  }
 
   ~RealQosmosClassifier() override {
     // RAII: if classifyFirstPdu never ran (e.g. silence timeout, early
@@ -270,6 +353,29 @@ public:
       ENVOY_LOG(debug, "qosmos_dpi: qmdpi_worker_pdu_set returned {}", rc);
       result.engine_error = true;
       // Continue — flow_destroy below may still produce a useful final.
+    }
+
+    // Stream-mode: hand the engine the (synthesised) inner-most L3/L4
+    // headers built from the 5-tuple cached at flow_create time. Empirically
+    // verified 2026-05-18 NOT required for plain TCP/HTTP/SSL pinning —
+    // qmdpi_flow_create already told the engine the L3/L4 protocol IDs
+    // (Q_PROTO_IP + Q_PROTO_TCP) and the 5-tuple. But qmdpi.h:735 lists
+    // it as REQUIRED for protocols whose disambiguation needs L3/L4
+    // header bytes (IPSEC-over-UDP, Skype-over-TCP). Cheap to keep wired
+    // up so the engine has them available if a flow ever needs them.
+    //
+    // IPv4 only in phase-1; IPv6 connections skip header_set (the listener
+    // accepts v6 flows, but their classification path predated this call
+    // and was already correct for HTTP/SSL).
+    if (is_v4_) {
+      void* l3 = static_cast<void*>(&ip4_);
+      void* l4 = static_cast<void*>(&tcp_);
+      rc = qmdpi_worker_pdu_header_set(worker_, l3, l4);
+      if (rc != 0) {
+        ENVOY_LOG(debug, "qosmos_dpi: qmdpi_worker_pdu_header_set returned {}",
+                  rc);
+        result.engine_error = true;
+      }
     }
 
     qmdpi_result* intermediate = nullptr;
@@ -358,6 +464,11 @@ private:
   qmdpi_flow* flow_;
   int ssl_proto_id_;
   int alpn_attr_id_;
+  bool is_v4_;
+  // Pre-baked synthesised inner-most headers, addresses fed to
+  // qmdpi_worker_pdu_header_set on every classify call.
+  SynthIp4Hdr ip4_{};
+  SynthTcpHdr tcp_{};
 };
 
 }  // namespace
@@ -385,7 +496,9 @@ QosmosClassifierPtr QosmosEngine::makeClassifier(bool is_v6, const void* src_ip,
     return nullptr;
   }
   return std::make_unique<RealQosmosClassifier>(worker, bundle_, flow,
-                                                  ssl_proto_id_, alpn_attr_id_);
+                                                  ssl_proto_id_, alpn_attr_id_,
+                                                  is_v6, src_ip, src_port_nbo,
+                                                  dst_ip, dst_port_nbo);
 }
 
 }  // namespace QosmosDpi
