@@ -454,7 +454,7 @@ protected:
     envoy::extensions::filters::listener::qosmos_dpi::v3::QosmosDpi proto =
         defaultProto();
     proto.set_verdict_cache_correction_enabled(true);
-    proto.set_verdict_cache_max_entries(100);
+    proto.set_verdict_cache_total_entries(100);
     config_ = std::make_shared<Config>(proto, factory_, table_,
                                         *stats_store_.rootScope(),
                                         cache_.get());
