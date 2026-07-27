@@ -361,7 +361,7 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
           absl::optional<bool>(verdict_is_web), config_->engine(),
           bytes_peeked_this_pdu_);
       cb_->filterState().setData(
-          Extensions::Common::QosmosDpi::QosmosFlowHandoff::key(),
+          Extensions::Common::QosmosDpi::QosmosFlowHandoff::filterStateKey(),
           std::move(handoff),
           StreamInfo::FilterState::StateType::Mutable,
           StreamInfo::FilterState::LifeSpan::Connection);
@@ -400,7 +400,7 @@ void Filter::onSilenceTimeout() {
         config_->engine(),
         0 /* no bytes peeked — classifyPdu never ran */);
     cb_->filterState().setData(
-        Extensions::Common::QosmosDpi::QosmosFlowHandoff::key(),
+        Extensions::Common::QosmosDpi::QosmosFlowHandoff::filterStateKey(),
         std::move(handoff),
         StreamInfo::FilterState::StateType::Mutable,
         StreamInfo::FilterState::LifeSpan::Connection);
