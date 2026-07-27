@@ -62,9 +62,26 @@ cc_import(
 
 # Bundle reader: linked statically. PIC variant for the same reason
 # as qmengine.
+#
+# libqmbundle bundles a modified zlib (most symbols prefixed dpi_zlib_)
+# but two data/code symbols slipped through un-prefixed: z_errmsg and
+# deflate_bounds. These collide with Envoy's zlib-ng at final link
+# (multiple definition of 'z_errmsg'). Rewrite them to qm_-prefixed
+# names before the .a reaches cc_import — the collision goes away and
+# Qosmos's internal callers still resolve because objcopy rewrites
+# both the definition AND the references in every .o inside the .a.
+genrule(
+    name = "libqmbundle_relocated",
+    srcs = ["lib/libqmbundle.fpic.a"],
+    outs = ["libqmbundle.reloc.fpic.a"],
+    cmd = "cp $< $@ && chmod +w $@ && objcopy " +
+          "--redefine-sym z_errmsg=qm_z_errmsg " +
+          "--redefine-sym deflate_bounds=qm_deflate_bounds $@",
+)
+
 cc_import(
     name = "qmbundle_static",
-    static_library = "lib/libqmbundle.fpic.a",
+    static_library = ":libqmbundle_relocated",
 )
 
 # Composite target the qosmos_dpi filter depends on.

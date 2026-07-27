@@ -1,0 +1,18 @@
+# Netskope-specific Bazel configs — tracked in git and portable across
+# developer hosts. Per-developer glue (compiler paths, --jobs, absolute
+# /opt/... paths) stays in the gitignored user.bazelrc.
+#
+# Auto-included from the root .bazelrc via `try-import %workspace%/netskope.bazelrc`.
+
+# ---------------------------------------------------------------------
+# ns-clang-trim: inherits --config=ns-clang (defined in user.bazelrc,
+# Netskope tooling clang-18 + libstdc++ from GCC 15 + gold linker) and
+# swaps in the trimmed extensions_build_config.bzl from
+# %workspace%/netskope/build_config/. Only the ~20 extensions the phase-1
+# qosmos_dpi topology (topology-C) references stay enabled; the other
+# ~180 are commented out. Shrinks the envoy-static link's peak RSS below
+# the 8 GB swap threshold and cuts clean build from ~12 h to ~1-2 h.
+# See netskope/build_config/extensions_build_config.bzl for the enabled list.
+# ---------------------------------------------------------------------
+build:ns-clang-trim --config=ns-clang
+build:ns-clang-trim --override_repository=envoy_build_config=%workspace%/netskope/build_config
