@@ -15,40 +15,11 @@ licenses(["notice"])  # Apache 2
 
 envoy_extension_package()
 
-# Read-only catalog driving the web/non-web cascade. Loaded once at engine
-# init from qosmos_protocols.json (produced by csv_to_json.py). Shared by
-# all worker threads as `const ProtocolTable&` — see protocol_table.h for
-# the singleton vs per-worker rationale.
-envoy_cc_library(
-    name = "protocol_table_lib",
-    srcs = ["protocol_table.cc"],
-    hdrs = ["protocol_table.h"],
-    deps = [
-        "//source/common/json:json_loader_lib",
-        "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/container:flat_hash_set",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-    ],
-)
-
-# Process-wide Qosmos engine + bundle + cascade table held in
-# Singleton::Manager. Plus per-worker QosmosWorker handles via
-# ThreadLocal::TypedSlot. See qosmos_engine.h for the lifetime contract.
-envoy_cc_library(
-    name = "qosmos_engine_lib",
-    srcs = ["qosmos_engine.cc"],
-    hdrs = ["qosmos_engine.h"],
-    deps = [
-        ":protocol_table_lib",
-        "//envoy/singleton:instance_interface",
-        "//envoy/thread_local:thread_local_interface",
-        "//source/common/common:logger_lib",
-        "//source/common/common:minimal_logger_lib",
-        "@com_google_absl//absl/strings",
-        "@qosmos_sdk//:qmdpi",
-    ],
-)
+# ProtocolTable and QosmosEngine moved to source/extensions/common/qosmos_dpi/
+# so the future envoy.filters.network.qosmos_dpi_correction filter (verdict-
+# cache correction; see ~/.claude/plans/envoy-qosmos-cache.md) can depend on
+# them without introducing a listener-filter cycle. Depend on the new
+# targets rather than re-declaring them here.
 
 # The listener filter itself. One instance per accepted connection.
 # State machine + flow lifecycle per docs/qosmos-dpi-integration-plan.md
@@ -59,7 +30,7 @@ envoy_cc_library(
     srcs = ["qosmos_dpi.cc"],
     hdrs = ["qosmos_dpi.h"],
     deps = [
-        ":qosmos_engine_lib",
+        "//source/extensions/common/qosmos_dpi:qosmos_engine_lib",
         "//envoy/event:dispatcher_interface",
         "//envoy/event:timer_interface",
         "//envoy/network:filter_interface",
@@ -84,7 +55,7 @@ envoy_cc_extension(
     srcs = ["config.cc"],
     deps = [
         ":qosmos_dpi_lib",
-        ":qosmos_engine_lib",
+        "//source/extensions/common/qosmos_dpi:qosmos_engine_lib",
         "//envoy/registry",
         "//envoy/server:filter_config_interface",
         "//envoy/singleton:manager_interface",

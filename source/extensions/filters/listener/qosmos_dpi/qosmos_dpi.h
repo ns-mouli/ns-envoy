@@ -11,7 +11,7 @@
 #include "envoy/stats/stats_macros.h"
 
 #include "source/common/common/logger.h"
-#include "source/extensions/filters/listener/qosmos_dpi/qosmos_engine.h"
+#include "source/extensions/common/qosmos_dpi/qosmos_engine.h"
 
 #include "envoy/extensions/filters/listener/qosmos_dpi/v3/qosmos_dpi.pb.h"
 
@@ -19,6 +19,20 @@ namespace Envoy {
 namespace Extensions {
 namespace ListenerFilters {
 namespace QosmosDpi {
+
+// Shared plumbing moved to source/extensions/common/qosmos_dpi/. Import
+// the symbols this filter references so the existing unqualified names
+// (QosmosEngine, QosmosClassifier, ClassifyResult, Hooks, ProtocolTable,
+// ...) still resolve. Adding new imports here is cheaper than touching
+// every reference site.
+using ::Envoy::Extensions::Common::QosmosDpi::ClassifyResult;
+using ::Envoy::Extensions::Common::QosmosDpi::Hooks;
+using ::Envoy::Extensions::Common::QosmosDpi::ProtocolTable;
+using ::Envoy::Extensions::Common::QosmosDpi::QosmosClassifier;
+using ::Envoy::Extensions::Common::QosmosDpi::QosmosClassifierPtr;
+using ::Envoy::Extensions::Common::QosmosDpi::QosmosEngine;
+using ::Envoy::Extensions::Common::QosmosDpi::QosmosEngineSharedPtr;
+using ::Envoy::Extensions::Common::QosmosDpi::QosmosWorker;
 
 // Factory function the Filter uses to obtain a per-connection classifier.
 // In production this delegates to QosmosEngine::makeClassifier(). Tests

@@ -7,7 +7,7 @@
 #include "envoy/thread_local/thread_local.h"
 
 #include "source/common/common/logger.h"
-#include "source/extensions/filters/listener/qosmos_dpi/protocol_table.h"
+#include "source/extensions/common/qosmos_dpi/protocol_table.h"
 
 extern "C" {
 #include "qmdpi.h"
@@ -15,7 +15,7 @@ extern "C" {
 
 namespace Envoy {
 namespace Extensions {
-namespace ListenerFilters {
+namespace Common {
 namespace QosmosDpi {
 
 // Result of a single first-PDU classification round: the engine's
@@ -167,6 +167,6 @@ private:
 using QosmosEngineSharedPtr = std::shared_ptr<QosmosEngine>;
 
 }  // namespace QosmosDpi
-}  // namespace ListenerFilters
+}  // namespace Common
 }  // namespace Extensions
 }  // namespace Envoy
