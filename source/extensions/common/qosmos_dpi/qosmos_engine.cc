@@ -12,6 +12,8 @@
 
 #include "absl/strings/str_format.h"
 
+#include "source/extensions/common/qosmos_dpi/verdict_cache.h"
+
 extern "C" {
 #include "dpi/protodef.h"  // Q_PROTO_IP, Q_PROTO_IP6, Q_PROTO_TCP
 }
@@ -70,7 +72,8 @@ QosmosEngine::QosmosEngine(const std::string& engine_config,
                            const std::string& bundle_path,
                            const std::string& table_path,
                            uint32_t nb_workers,
-                           ThreadLocal::SlotAllocator& tls) {
+                           ThreadLocal::SlotAllocator& tls,
+                           uint32_t verdict_cache_max_entries) {
   // 1. Engine.
   const std::string config = resolveEngineConfig(engine_config, nb_workers);
   ENVOY_LOG(info, "qosmos_dpi: creating engine (config='{}')", config);
@@ -179,9 +182,29 @@ QosmosEngine::QosmosEngine(const std::string& engine_config,
   worker_slot_->set([engine_ptr](Event::Dispatcher&) {
     return std::make_shared<QosmosWorker>(engine_ptr);
   });
+
+  // 5. Per-worker verdict cache. Only allocated when
+  //    verdict_cache_max_entries > 0; a null cache_slot_ acts as the
+  //    "cache disabled" signal for verdictCacheEnabled() /
+  //    cacheForThisThread() callers.
+  if (verdict_cache_max_entries > 0) {
+    const uint32_t effective_max =
+        verdict_cache_max_entries == 0 ? 100000U : verdict_cache_max_entries;
+    cache_slot_ = ThreadLocal::TypedSlot<VerdictCache>::makeUnique(tls);
+    cache_slot_->set([effective_max](Event::Dispatcher&) {
+      return std::make_shared<VerdictCache>(effective_max);
+    });
+    ENVOY_LOG(info,
+              "qosmos_dpi: verdict cache enabled (per-worker, max_entries={})",
+              effective_max);
+  }
 }
 
 QosmosEngine::~QosmosEngine() {
+  // Order: caches (per-thread) → workers (per-thread) → bundle → engine.
+  // cache_slot_ is fine to reset before worker_slot_ — cache entries are
+  // owned by the cache, not the worker.
+  cache_slot_.reset();
   // Order: workers (per-thread) → bundle → engine. workers go away when
   // worker_slot_ resets — that triggers ~QosmosWorker on each worker thread.
   worker_slot_.reset();
@@ -210,6 +233,12 @@ QosmosWorker& QosmosEngine::workerForThisThread() {
   // a runOnAllThreads() will trip the underlying assert — that's the
   // intended Envoy contract for ThreadLocal.
   return worker_slot_->get().ref();
+}
+
+VerdictCache& QosmosEngine::cacheForThisThread() {
+  // Callers must check verdictCacheEnabled() first — this method
+  // dereferences cache_slot_ unconditionally.
+  return cache_slot_->get().ref();
 }
 
 // ─────────── Real Qosmos classifier implementation ───────────
@@ -336,8 +365,11 @@ public:
 
   bool flowAlive() const override { return flow_ != nullptr; }
 
-  ClassifyResult classifyFirstPdu(const void* bytes, int len, int direction,
-                                   int tenant_id) override {
+  // Feed one PDU. NO flow_destroy — the flow stays alive for a subsequent
+  // call. Populates result.intermediate_path, result.hooks (ssl:alpn), and
+  // result.final_state (from QMDPI_RESULT_FLAGS_CLASSIFIED_FINAL_STATE).
+  ClassifyResult classifyPdu(const void* bytes, int len, int direction,
+                              int tenant_id) override {
     ClassifyResult result;
     if (flow_ == nullptr || worker_ == nullptr) {
       result.engine_error = true;
@@ -396,35 +428,45 @@ public:
       // is the very first client byte stream, so ALPN is typically
       // available on the intermediate path already — before flow_destroy.
       extractAlpn(intermediate, result.hooks);
+      // Finality signal: set iff the engine has decided nothing new will
+      // change the classification given more bytes. Only meaningful on
+      // this (pre-destroy) path.
+      const qmdpi_result_flags* flags = qmdpi_result_flags_get(intermediate);
+      if (flags != nullptr) {
+        result.final_state =
+            QMDPI_RESULT_FLAGS_CLASSIFIED_FINAL_STATE(flags) != 0;
+      }
       ENVOY_LOG(debug, "qosmos_dpi: post-process result={} path_ptr={} "
-                        "rendered_path='{}' rc={}",
+                        "rendered_path='{}' final_state={} rc={}",
                 fmt::ptr(intermediate), fmt::ptr(p),
-                result.intermediate_path, rc);
+                result.intermediate_path, result.final_state, rc);
     } else {
       ENVOY_LOG(debug, "qosmos_dpi: post-process result is NULL (rc={})", rc);
     }
+    return result;
+  }
 
-    // ALWAYS qmdpi_flow_destroy — see plan §1, §7.4. Whether the
-    // intermediate was conclusive or not, the per-flow state is no
-    // longer needed (we will not feed more bytes). The destroy out-param
-    // is the engine's best-guess final result.
+  // qmdpi_flow_destroy: releases per-flow engine state and returns the
+  // engine's best-guess final path via the out-param. Idempotent.
+  ClassifyResult finalize() override {
+    ClassifyResult result;
+    if (flow_ == nullptr) {
+      // Already finalized (or never had a flow). Return an empty result
+      // with engine_error=false — a repeat finalize() is not an error.
+      return result;
+    }
     qmdpi_result* final_result = nullptr;
-    rc = qmdpi_flow_destroy(worker_, flow_, &final_result);
+    int rc = qmdpi_flow_destroy(worker_, flow_, &final_result);
     if (rc != 0) {
       ENVOY_LOG(debug, "qosmos_dpi: qmdpi_flow_destroy returned {}", rc);
+      result.engine_error = true;
     }
     flow_ = nullptr;
     if (final_result != nullptr) {
       qmdpi_path* p = qmdpi_result_path_get(final_result);
       result.final_path = pathToString(bundle_, p);
-      // Re-extract ssl:alpn from final result IF the intermediate didn't
-      // produce one (e.g. flow that pinned to ssl only after destroy).
-      // We don't overwrite — first-seen wins.
-      if (result.hooks.find("ssl:alpn") == result.hooks.end()) {
-        extractAlpn(final_result, result.hooks);
-      }
+      extractAlpn(final_result, result.hooks);
     }
-
     return result;
   }
 

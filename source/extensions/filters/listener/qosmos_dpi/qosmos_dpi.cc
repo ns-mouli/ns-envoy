@@ -10,6 +10,8 @@
 
 #include "source/common/protobuf/utility.h"
 #include "source/common/tcp_proxy/tcp_proxy.h"
+#include "source/extensions/common/qosmos_dpi/qosmos_flow_handoff.h"
+#include "source/extensions/common/qosmos_dpi/verdict_cache.h"
 
 #include "absl/strings/string_view.h"
 
@@ -46,6 +48,28 @@ struct FiveTuple {
   uint16_t dst_port_nbo{};
   bool is_v6{false};
 };
+
+// Build a VerdictCacheKey from the connection's destination address +
+// requested server name (populated by tls_inspector when present). Returns
+// a key with empty dst_ip iff there is no usable v4/v6 destination — the
+// caller should treat that as "skip cache lookup and populate" for this
+// connection.
+Extensions::Common::QosmosDpi::VerdictCacheKey
+computeCacheKey(const Network::ConnectionInfoProvider& info) {
+  Extensions::Common::QosmosDpi::VerdictCacheKey key;
+  const auto& local = info.directLocalAddress();
+  if (local == nullptr || local->ip() == nullptr) return key;
+  key.dst_ip = local->ip()->addressAsString();
+  key.dst_port = local->ip()->port();
+  const absl::string_view sni = info.requestedServerName();
+  if (!sni.empty()) {
+    key.kind = Extensions::Common::QosmosDpi::DiscriminatorKind::Sni;
+    key.discriminator_value.assign(sni.data(), sni.size());
+  } else {
+    key.kind = Extensions::Common::QosmosDpi::DiscriminatorKind::Plain;
+  }
+  return key;
+}
 
 FiveTuple readFiveTuple(const Network::ConnectionInfoProvider& info) {
   FiveTuple t{};
@@ -92,6 +116,7 @@ Config::Config(const ProtoConfig& proto, QosmosEngineSharedPtr engine,
       max_inspect_bytes_(proto.max_inspect_bytes() == 0 ? 1024
                                                         : proto.max_inspect_bytes()),
       close_on_engine_error_(proto.close_on_engine_error()),
+      verdict_cache_correction_enabled_(proto.verdict_cache_correction_enabled()),
       stats_(generateStats(scope)) {
   // Production path: classifier factory delegates to the singleton engine.
   // Capture engine_ by raw pointer (the shared_ptr is held in this Config).
@@ -125,6 +150,7 @@ Config::Config(const ProtoConfig& proto, ClassifierFactory factory,
       max_inspect_bytes_(proto.max_inspect_bytes() == 0 ? 1024
                                                         : proto.max_inspect_bytes()),
       close_on_engine_error_(proto.close_on_engine_error()),
+      verdict_cache_correction_enabled_(proto.verdict_cache_correction_enabled()),
       stats_(generateStats(scope)) {}
 
 // ──────────────── Filter ────────────────
@@ -136,16 +162,25 @@ Filter::~Filter() {
 }
 
 void Filter::recordClassifierDestruction() {
-  // Called from ~Filter. classifier_ may already be empty (if we never
-  // accepted a flow due to engine error in onAccept). If it has a flow
-  // still alive, that means classifyFirstPdu never ran — either silence
-  // timeout fired (already counted via flows_released_at_verdict in
-  // onSilenceTimeout) or the connection closed early (count as
-  // flows_released_at_close).
+  // Called from ~Filter. classifier_ may already be empty for two reasons:
+  //   (a) we never accepted a flow (engine error in onAccept), or
+  //   (b) the flow was handed off to the correction network filter via
+  //       QosmosFlowHandoff (handed_off_ tracks this).
+  // In case (b) the QosmosFlowHandoff (owned by FilterState) still counts
+  // as an active flow — the correction filter is the one that will
+  // eventually destroy it. We nonetheless decrement flows_active_ here
+  // because that gauge tracks flows held by THIS listener filter; the
+  // correction filter maintains its own correction_flows_active gauge.
   //
-  // We can't tell the two apart from inside the destructor; the
-  // verdict_set_ flag is the discriminator. silence-timeout calls
-  // setVerdict so verdict_set_ is true; early-close hasn't.
+  // If classifier_ has a still-alive flow at destructor time, that means
+  // classifyFirstPdu / classifyPdu / finalize never ran (early close, or
+  // silence timeout without correction enabled). verdict_set_ is the
+  // discriminator between silence-timeout (verdict was set) and early
+  // close (verdict was not set).
+  if (handed_off_) {
+    config_->stats().flows_active_.dec();
+    return;
+  }
   if (classifier_ == nullptr) return;
   const bool was_alive = classifier_->flowAlive();
   classifier_.reset();   // RAII destroy — qmdpi_flow_destroy if needed
@@ -161,7 +196,34 @@ void Filter::recordClassifierDestruction() {
 Network::FilterStatus Filter::onAccept(Network::ListenerFilterCallbacks& cb) {
   cb_ = &cb;
 
-  const FiveTuple t = readFiveTuple(cb.socket().connectionInfoProvider());
+  const auto& info = cb.socket().connectionInfoProvider();
+
+  // Verdict-cache lookup, when enabled. On hit: set the verdict directly
+  // from the cached entry and Continue without touching Qosmos. On miss:
+  // stash the key on the filter so onData/onSilenceTimeout can populate
+  // the cache and hand off the flow to the correction filter.
+  //
+  // When disabled, cache_key_ stays empty and every branch below (which
+  // gates on !cache_key_.dst_ip.empty() && config_->verdictCacheCorrectionEnabled())
+  // behaves exactly as today.
+  if (config_->verdictCacheCorrectionEnabled() && config_->engine() != nullptr &&
+      config_->engine()->verdictCacheEnabled()) {
+    cache_key_ = computeCacheKey(info);
+    if (!cache_key_.dst_ip.empty()) {
+      auto& cache = config_->engine()->cacheForThisThread();
+      auto hit = cache.lookup(cache_key_);
+      if (hit.has_value()) {
+        config_->stats().verdict_cache_hit_.inc();
+        const auto& cluster = hit->verdict_is_web ? config_->webCluster()
+                                                  : config_->nonWebCluster();
+        setVerdict(cluster, hit->verdict_is_web);
+        return Network::FilterStatus::Continue;
+      }
+      config_->stats().verdict_cache_miss_.inc();
+    }
+  }
+
+  const FiveTuple t = readFiveTuple(info);
   classifier_ = config_->classifierFactory()(
       t.is_v6,
       t.is_v6 ? static_cast<const void*>(&t.v6_src)
@@ -210,9 +272,25 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
   const auto slice = buffer.rawSlice();
   config_->stats().bytes_processed_.recordValue(static_cast<uint64_t>(slice.len_));
 
-  ClassifyResult cr = classifier_->classifyFirstPdu(
-      slice.mem_, static_cast<int>(slice.len_), QMDPI_DIR_CTS,
-      static_cast<int>(config_->defaultTenantId()));
+  const bool correction_enabled =
+      config_->verdictCacheCorrectionEnabled() && config_->engine() != nullptr &&
+      config_->engine()->verdictCacheEnabled() && !cache_key_.dst_ip.empty();
+
+  // When correction is enabled we call classifyPdu (no flow_destroy) so
+  // the correction network filter can keep feeding the same flow past the
+  // 4-packet boundary. Otherwise, preserve today's classifyFirstPdu shape
+  // (single-shot, immediate flow_destroy).
+  ClassifyResult cr;
+  if (correction_enabled) {
+    cr = classifier_->classifyPdu(
+        slice.mem_, static_cast<int>(slice.len_), QMDPI_DIR_CTS,
+        static_cast<int>(config_->defaultTenantId()));
+    bytes_peeked_this_pdu_ = slice.len_;
+  } else {
+    cr = classifier_->classifyFirstPdu(
+        slice.mem_, static_cast<int>(slice.len_), QMDPI_DIR_CTS,
+        static_cast<int>(config_->defaultTenantId()));
+  }
   classify_invoked_ = true;
 
   if (cr.engine_error) {
@@ -245,7 +323,9 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
               verdict.has_value() ? (*verdict ? "web" : "non-web") : "null");
   }
 
+  bool verdict_is_web = false;
   if (verdict.has_value() && *verdict) {
+    verdict_is_web = true;
     setVerdict(config_->webCluster(), /*is_web=*/true);
   } else if (verdict.has_value() && !*verdict) {
     setVerdict(config_->nonWebCluster(), /*is_web=*/false);
@@ -253,6 +333,45 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
     config_->stats().inconclusive_forced_cfw_.inc();
     setVerdict(config_->nonWebCluster(), /*is_web=*/false);
   }
+
+  // Cache-populate + optional hand-off. Only when correction is enabled
+  // AND we reached a real verdict (not the inconclusive default) — caching
+  // "we had no signal, defaulted to non-web" would poison the cache and
+  // suppress every future connection's DPI on that destination.
+  if (correction_enabled && verdict.has_value() && cb_ != nullptr) {
+    auto& cache = config_->engine()->cacheForThisThread();
+    if (!cache.put(cache_key_, verdict_is_web, "4pkt")) {
+      config_->stats().verdict_cache_reject_full_.inc();
+    }
+    config_->stats().verdict_cache_size_.set(cache.size());
+
+    if (cr.final_state) {
+      // Rare: the engine already reached a final classification on this
+      // very first PDU. Nothing to correct — finalize the flow here and
+      // don't burden the correction filter with a hand-off.
+      classifier_->finalize();
+    } else {
+      // Park the live classifier in FilterState for the correction filter
+      // to pick up on the network-filter side. If no correction filter is
+      // present in filter_chains, ~QosmosFlowHandoff will RAII-destroy the
+      // flow at connection close — no leak.
+      auto handoff = std::make_unique<
+          Extensions::Common::QosmosDpi::QosmosFlowHandoff>(
+          std::move(classifier_), cache_key_,
+          absl::optional<bool>(verdict_is_web), config_->engine(),
+          bytes_peeked_this_pdu_);
+      cb_->filterState().setData(
+          Extensions::Common::QosmosDpi::QosmosFlowHandoff::key(),
+          std::move(handoff),
+          StreamInfo::FilterState::StateType::Mutable,
+          StreamInfo::FilterState::LifeSpan::Connection);
+      config_->stats().handed_off_to_correction_.inc();
+      handed_off_ = true;
+      // classifier_ is now empty; recordClassifierDestruction() will
+      // decrement flows_active_ via the handed_off_ branch.
+    }
+  }
+
   return Network::FilterStatus::Continue;
 }
 
@@ -260,6 +379,35 @@ void Filter::onSilenceTimeout() {
   ENVOY_LOG(debug, "qosmos_dpi: silence timeout fired (server-greets-first?), "
                     "defaulting to {}", config_->nonWebCluster());
   config_->stats().silence_timeout_.inc();
+
+  const bool correction_enabled =
+      config_->verdictCacheCorrectionEnabled() && config_->engine() != nullptr &&
+      config_->engine()->verdictCacheEnabled() && !cache_key_.dst_ip.empty() &&
+      classifier_ != nullptr && classifier_->flowAlive() && cb_ != nullptr;
+
+  // When correction is enabled, hand off the live-but-fed-nothing classifier
+  // before setting the fallback verdict. The correction filter will see
+  // initial_verdict_is_web == nullopt and treat any later real
+  // classification as a first-time cache populate rather than a correction.
+  // Do NOT cache the fallback here — a wrongly-guessed destination would
+  // never get re-DPI'd on the next connection. See plan Part B (silence-
+  // timeout hand-off) for the rationale.
+  if (correction_enabled) {
+    auto handoff = std::make_unique<
+        Extensions::Common::QosmosDpi::QosmosFlowHandoff>(
+        std::move(classifier_), cache_key_,
+        absl::optional<bool>(),          // no prior verdict
+        config_->engine(),
+        0 /* no bytes peeked — classifyPdu never ran */);
+    cb_->filterState().setData(
+        Extensions::Common::QosmosDpi::QosmosFlowHandoff::key(),
+        std::move(handoff),
+        StreamInfo::FilterState::StateType::Mutable,
+        StreamInfo::FilterState::LifeSpan::Connection);
+    config_->stats().handed_off_to_correction_.inc();
+    handed_off_ = true;
+  }
+
   setVerdict(config_->nonWebCluster(), /*is_web=*/false);
   if (cb_ != nullptr) {
     cb_->continueFilterChain(true);

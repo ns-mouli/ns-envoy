@@ -46,14 +46,36 @@ public:
 
   bool flowAlive() const override { return flow_alive_; }
 
-  ClassifyResult classifyFirstPdu(const void* bytes, int len, int direction,
-                                   int tenant_id) override {
+  // The interface split classifyFirstPdu into classifyPdu (no destroy) +
+  // finalize (destroy). The base class provides a non-virtual
+  // classifyFirstPdu that composes the two — which is exactly the shape
+  // the pre-cache listener filter path exercises. Override the primitives.
+  ClassifyResult classifyPdu(const void* bytes, int len, int direction,
+                              int tenant_id) override {
     classify_called_ = true;
     classify_bytes_.assign(static_cast<const char*>(bytes), len);
     classify_direction_ = direction;
     classify_tenant_ = tenant_id;
-    flow_alive_ = false;   // mirrors RealQosmosClassifier semantics.
-    return result_;
+    // result_ carries the intermediate_path / hooks / final_state that
+    // the pre-cache tests set up. final_path stays owned by finalize().
+    ClassifyResult r;
+    r.intermediate_path = result_.intermediate_path;
+    r.hooks = result_.hooks;
+    r.engine_error = result_.engine_error;
+    r.final_state = result_.final_state;
+    return r;
+  }
+
+  ClassifyResult finalize() override {
+    // Mirror RealQosmosClassifier semantics: flow goes away, subsequent
+    // finalize() calls are no-ops.
+    if (!flow_alive_) return ClassifyResult{};
+    flow_alive_ = false;
+    ClassifyResult r;
+    r.final_path = result_.final_path;
+    // ssl:alpn stays where the caller put it in result_.hooks; the merge
+    // logic in QosmosClassifier::classifyFirstPdu handles first-write-wins.
+    return r;
   }
 
   // Test inputs.

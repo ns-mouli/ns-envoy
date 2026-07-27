@@ -37,16 +37,31 @@ public:
     // configured triggers engine create + bundle activate + protocol-table
     // load. Subsequent listener-filter-config loads (e.g. multiple
     // listeners) reuse the same engine.
+    // The verdict cache is a per-worker slot on the engine. It's allocated
+    // iff proto_config.verdict_cache_correction_enabled AND max_entries > 0
+    // (falling back to a built-in default when max_entries == 0 in the
+    // engine ctor). Only the FIRST listener config to trigger engine
+    // construction actually decides whether the cache is on — subsequent
+    // configs (same singleton) inherit that shape. This matches how the
+    // listener filter has always treated the singleton engine.
+    const uint32_t cache_max_entries =
+        proto_config.verdict_cache_correction_enabled()
+            ? (proto_config.verdict_cache_max_entries() == 0
+                   ? 100000U
+                   : proto_config.verdict_cache_max_entries())
+            : 0U;
     QosmosEngineSharedPtr engine =
         server_context.singletonManager().getTyped<QosmosEngine>(
             SINGLETON_MANAGER_REGISTERED_NAME(qosmos_engine),
-            [&server_context, &proto_config]() -> std::shared_ptr<QosmosEngine> {
+            [&server_context, &proto_config, cache_max_entries]()
+                -> std::shared_ptr<QosmosEngine> {
               return std::make_shared<QosmosEngine>(
                   proto_config.engine_config_path(),
                   proto_config.protocol_bundle_path(),
                   proto_config.protocol_table_path(),
                   server_context.options().concurrency(),
-                  server_context.threadLocal());
+                  server_context.threadLocal(),
+                  cache_max_entries);
             });
 
     ConfigSharedPtr config =

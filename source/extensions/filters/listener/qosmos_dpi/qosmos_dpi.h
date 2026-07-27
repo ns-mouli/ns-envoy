@@ -12,6 +12,7 @@
 
 #include "source/common/common/logger.h"
 #include "source/extensions/common/qosmos_dpi/qosmos_engine.h"
+#include "source/extensions/common/qosmos_dpi/verdict_cache.h"
 
 #include "envoy/extensions/filters/listener/qosmos_dpi/v3/qosmos_dpi.pb.h"
 
@@ -62,6 +63,17 @@ using ClassifierFactory =
 //   flows_released_at_close   releaseFlow() called from onClose belt-and-braces
 //                             (rare — client disconnected before any verdict)
 //   bytes_processed           histogram of bytes_inspected per connection
+//   verdict_cache_hit         onAccept lookup found an existing entry; DPI
+//                             skipped entirely for this connection
+//   verdict_cache_miss        onAccept lookup found nothing; DPI proceeded
+//   verdict_cache_reject_full  put() attempted on a new key when the cache
+//                             is at max_entries (no eviction — new key
+//                             dropped); rare, indicates a capacity bump is
+//                             needed
+//   handed_off_to_correction  onData/onSilenceTimeout parked a QosmosFlowHandoff
+//                             in FilterState for the correction network filter
+//                             to claim
+//   verdict_cache_size        current per-worker cache entry count (gauge)
 #define ALL_QOSMOS_DPI_STATS(COUNTER, GAUGE, HISTOGRAM)                       \
   COUNTER(web_classified)                                                     \
   COUNTER(non_web_classified)                                                 \
@@ -70,7 +82,12 @@ using ClassifierFactory =
   COUNTER(engine_error)                                                       \
   COUNTER(flows_released_at_verdict)                                          \
   COUNTER(flows_released_at_close)                                            \
+  COUNTER(verdict_cache_hit)                                                  \
+  COUNTER(verdict_cache_miss)                                                 \
+  COUNTER(verdict_cache_reject_full)                                          \
+  COUNTER(handed_off_to_correction)                                           \
   GAUGE(flows_active, NeverImport)                                            \
+  GAUGE(verdict_cache_size, NeverImport)                                      \
   HISTOGRAM(bytes_processed, Bytes)
 
 struct QosmosDpiStats {
@@ -112,6 +129,19 @@ public:
   uint32_t maxInspectBytes() const { return max_inspect_bytes_; }
   bool closeOnEngineError() const { return close_on_engine_error_; }
 
+  // Verdict-cache + correction knobs (proto fields 10 + 11). Off by default;
+  // the filter's onAccept/onData/onSilenceTimeout branches are byte-for-byte
+  // identical to today's behaviour when this returns false.
+  bool verdictCacheCorrectionEnabled() const {
+    return verdict_cache_correction_enabled_;
+  }
+
+  // Non-null in production iff verdictCacheCorrectionEnabled() is true.
+  // Null in the test constructor (tests exercising the correction path use
+  // dedicated fixtures — see plan Part I). Kept as a raw pointer because
+  // Config already owns the QosmosEngine shared_ptr.
+  QosmosEngine* engine() const { return engine_.get(); }
+
   QosmosDpiStats& stats() { return stats_; }
 
 private:
@@ -128,6 +158,7 @@ private:
   uint32_t default_tenant_id_;
   uint32_t max_inspect_bytes_;
   bool close_on_engine_error_;
+  bool verdict_cache_correction_enabled_{false};
   QosmosDpiStats stats_;
 };
 
@@ -183,6 +214,17 @@ private:
   Event::TimerPtr silence_timer_;
   bool verdict_set_{false};
   bool classify_invoked_{false};   // true once classifyFirstPdu has run.
+  bool handed_off_{false};         // true once classifier_ was moved into
+                                    // a QosmosFlowHandoff in FilterState.
+  // Only populated when verdictCacheCorrectionEnabled(). Computed in
+  // onAccept from the connection's 5-tuple + SNI (if tls_inspector ran).
+  // Empty dst_ip signals "no key computed" (either the cache is off or
+  // the socket had no v4/v6 destination info yet — fail-safe: do not
+  // cache-lookup / cache-populate for this connection).
+  Extensions::Common::QosmosDpi::VerdictCacheKey cache_key_;
+  size_t bytes_peeked_this_pdu_{0};   // set in onData right before
+                                       // classifyPdu; consumed when a
+                                       // handoff is constructed.
 };
 
 }  // namespace QosmosDpi

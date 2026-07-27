@@ -33,6 +33,20 @@ envoy_cc_library(
     ],
 )
 
+# Per-Envoy-worker, thread-local verdict cache keyed on {dst-ip, dst-port,
+# discriminator}. Header-only. Consumed by qosmos_engine (which owns the
+# per-worker slot) and by the future qosmos_dpi_correction network filter.
+envoy_cc_library(
+    name = "verdict_cache_lib",
+    hdrs = ["verdict_cache.h"],
+    deps = [
+        "//envoy/thread_local:thread_local_interface",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/hash",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
 # Process-wide Qosmos engine + bundle + cascade table held in
 # Singleton::Manager. Plus per-worker QosmosWorker handles via
 # ThreadLocal::TypedSlot. See qosmos_engine.h for the lifetime contract.
@@ -42,11 +56,28 @@ envoy_cc_library(
     hdrs = ["qosmos_engine.h"],
     deps = [
         ":protocol_table_lib",
+        ":verdict_cache_lib",
         "//envoy/singleton:instance_interface",
         "//envoy/thread_local:thread_local_interface",
         "//source/common/common:logger_lib",
         "//source/common/common:minimal_logger_lib",
         "@com_google_absl//absl/strings",
         "@qosmos_sdk//:qmdpi",
+    ],
+)
+
+# FilterState::Object payload the listener filter parks under
+# LifeSpan::Connection so the correction network filter can claim the live
+# Qosmos flow after tcp_proxy takes over. Header-only. Consumed by both
+# the listener filter and the correction filter — kept in common/ to
+# avoid a listener-filter dep cycle.
+envoy_cc_library(
+    name = "qosmos_flow_handoff_lib",
+    hdrs = ["qosmos_flow_handoff.h"],
+    deps = [
+        ":qosmos_engine_lib",
+        ":verdict_cache_lib",
+        "//envoy/stream_info:filter_state_interface",
+        "@com_google_absl//absl/types:optional",
     ],
 )
