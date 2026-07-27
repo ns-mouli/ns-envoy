@@ -50,18 +50,24 @@ public:
                    ? 100000U
                    : proto_config.verdict_cache_max_entries())
             : 0U;
+    // Process-wide flow-context budget. 0 in the proto ⇒ engine ctor
+    // substitutes its built-in default (300000). Per-worker nb_flows
+    // (which is what the SDK actually consumes) is derived by the engine
+    // as ceil(total_nb_flows / (nb_workers + 1)).
+    const uint32_t total_nb_flows = proto_config.total_nb_flows();
     QosmosEngineSharedPtr engine =
         server_context.singletonManager().getTyped<QosmosEngine>(
             SINGLETON_MANAGER_REGISTERED_NAME(qosmos_engine),
-            [&server_context, &proto_config, cache_max_entries]()
-                -> std::shared_ptr<QosmosEngine> {
+            [&server_context, &proto_config, cache_max_entries,
+             total_nb_flows]() -> std::shared_ptr<QosmosEngine> {
               return std::make_shared<QosmosEngine>(
                   proto_config.engine_config_path(),
                   proto_config.protocol_bundle_path(),
                   proto_config.protocol_table_path(),
                   server_context.options().concurrency(),
                   server_context.threadLocal(),
-                  cache_max_entries);
+                  cache_max_entries,
+                  total_nb_flows);
             });
 
     ConfigSharedPtr config =

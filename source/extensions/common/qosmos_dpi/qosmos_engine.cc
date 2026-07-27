@@ -48,7 +48,8 @@ QosmosWorker::~QosmosWorker() {
 }
 
 std::string QosmosEngine::resolveEngineConfig(const std::string& user_supplied,
-                                               uint32_t nb_workers) {
+                                               uint32_t nb_workers,
+                                               uint32_t total_nb_flows) {
   if (!user_supplied.empty()) {
     return user_supplied;
   }
@@ -60,12 +61,21 @@ std::string QosmosEngine::resolveEngineConfig(const std::string& user_supplied,
   //                    qmdpi_worker_create returns NULL when the count
   //                    matches exactly (one slot may be reserved for the
   //                    engine's own use); bumping by 1 avoids the race.
-  //   nb_flows=10000 — required for stream-mode flow allocation. The SDK
-  //                    example uses 1000 for packet mode; we bump to 10K
-  //                    because envoy connection rates can exceed packet-
-  //                    mode demos.
-  return absl::StrFormat("injection_mode=stream;nb_workers=%u;nb_flows=10000",
-                          nb_workers + 1);
+  //   nb_flows        — the SDK documents this as "maximum number of flow
+  //                    contexts PER WORKER" (see SDK examples
+  //                    napatech_integration/main.c:96,
+  //                    afp_integration/main.c and pcap_analyzer defaults).
+  //                    We honour a process-wide budget by dividing:
+  //                    per-worker = ceil(total_nb_flows / (nb_workers + 1)).
+  //                    Default total is 300000 (~600 MB engine-side flow-
+  //                    store; SDK's own pcap_analyzer defaults to 200000
+  //                    for reference).
+  const uint32_t total = total_nb_flows == 0 ? 300000U : total_nb_flows;
+  const uint32_t effective_workers = nb_workers + 1;
+  const uint32_t per_worker =
+      (total + effective_workers - 1) / effective_workers;   // ceil-divide
+  return absl::StrFormat("injection_mode=stream;nb_workers=%u;nb_flows=%u",
+                          effective_workers, per_worker);
 }
 
 QosmosEngine::QosmosEngine(const std::string& engine_config,
@@ -73,9 +83,11 @@ QosmosEngine::QosmosEngine(const std::string& engine_config,
                            const std::string& table_path,
                            uint32_t nb_workers,
                            ThreadLocal::SlotAllocator& tls,
-                           uint32_t verdict_cache_max_entries) {
+                           uint32_t verdict_cache_max_entries,
+                           uint32_t total_nb_flows) {
   // 1. Engine.
-  const std::string config = resolveEngineConfig(engine_config, nb_workers);
+  const std::string config =
+      resolveEngineConfig(engine_config, nb_workers, total_nb_flows);
   ENVOY_LOG(info, "qosmos_dpi: creating engine (config='{}')", config);
   engine_ = qmdpi_engine_create(config.c_str());
   if (engine_ == nullptr) {

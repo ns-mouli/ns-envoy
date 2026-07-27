@@ -32,7 +32,7 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 //
 // [#extension: envoy.filters.listener.qosmos_dpi]
 
-// [#next-free-field: 12]
+// [#next-free-field: 13]
 message QosmosDpi {
   // Path to the Qosmos engine config file. If empty, the filter synthesises
   // ``"injection_mode=stream;nb_workers=N"`` where N matches Envoy's worker
@@ -101,4 +101,22 @@ message QosmosDpi {
   // phase — a full cache rejects new keys (stat ``verdict_cache_reject_full``)
   // rather than evicting.
   uint32 verdict_cache_max_entries = 11;
+
+  // Total number of concurrent Qosmos flow contexts to reserve across all
+  // Envoy worker threads. The engine's per-worker ``nb_flows`` config knob
+  // is derived from this as ``ceil(total_nb_flows / nb_workers)``, so a
+  // 300k total on a 6-worker deployment gives each worker 50k slots.
+  //
+  // 0 ⇒ use built-in default 300000.
+  //
+  // Memory planning: each active flow context is ~2 KB with the standard
+  // protocol bundle (varies with which protocols are activated). At the
+  // 300000 default, expect ~600 MB of engine-side flow-store memory
+  // (~750–800 MB after hash-table + allocator overhead). ``qmdpi_stats_dump``
+  // is available at runtime for exact accounting.
+  //
+  // Only the synthesised default engine config uses this field. If
+  // ``engine_config_path`` is non-empty, the operator is expected to
+  // set ``nb_flows`` themselves inside that config string.
+  uint32 total_nb_flows = 12;
 }
