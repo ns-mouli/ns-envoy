@@ -26,6 +26,8 @@ envoy_cc_test(
         "//source/common/buffer:buffer_lib",
         "//source/common/stream_info:filter_state_lib",
         "//source/common/tcp_proxy",
+        "//source/extensions/common/qosmos_dpi:qosmos_flow_handoff_lib",
+        "//source/extensions/common/qosmos_dpi:verdict_cache_lib",
         "//source/extensions/filters/listener/qosmos_dpi:qosmos_dpi_lib",
         "//test/mocks/event:event_mocks",
         "//test/mocks/network:network_mocks",

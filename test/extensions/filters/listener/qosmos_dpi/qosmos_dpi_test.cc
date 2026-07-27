@@ -11,6 +11,8 @@
 #include "source/common/tcp_proxy/tcp_proxy.h"
 #include "source/extensions/filters/listener/qosmos_dpi/qosmos_dpi.h"
 #include "source/extensions/common/qosmos_dpi/qosmos_engine.h"
+#include "source/extensions/common/qosmos_dpi/qosmos_flow_handoff.h"
+#include "source/extensions/common/qosmos_dpi/verdict_cache.h"
 
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/network/mocks.h"
@@ -405,6 +407,261 @@ TEST_F(QosmosDpiFilterTest, SilenceTimeoutDefaultsToCfw) {
   EXPECT_EQ(config_->stats().non_web_classified_.value(), 1);
   EXPECT_TRUE(continue_called);
   EXPECT_FALSE(captured_mock_->classify_called_);   // classify never ran.
+}
+
+// ─────────── Verdict-cache + hand-off (Part I) ───────────
+//
+// Separate fixture: a real VerdictCache is injected via Config's test-only
+// ctor. verdict_cache_correction_enabled must be true on the proto for
+// verdictCacheForThisThread() to return the injected cache. The listener
+// filter's cache/handoff branches are unit-testable end-to-end this way
+// without a running QosmosEngine.
+
+class QosmosDpiCacheFilterTest : public testing::Test {
+protected:
+  void SetUp() override {
+    table_ = loadFixtureTable();
+    cache_ = std::make_unique<
+        Extensions::Common::QosmosDpi::VerdictCache>(/*max_entries=*/100);
+
+    auto remote_or = Network::Utility::resolveUrl("tcp://192.168.10.2:54321");
+    auto local_or = Network::Utility::resolveUrl("tcp://10.10.2.2:80");
+    ASSERT_TRUE(remote_or.ok());
+    ASSERT_TRUE(local_or.ok());
+    callbacks_.socket_.connection_info_provider_->setRemoteAddress(*remote_or);
+    // In production `original_dst` runs before qosmos_dpi and populates
+    // directLocalAddress. The cache key reads directLocalAddress, so
+    // set both fields here (the mock's default ctor left directLocalAddress
+    // null).
+    callbacks_.socket_.connection_info_provider_->setLocalAddress(*local_or);
+    callbacks_.socket_.connection_info_provider_->setDirectLocalAddressForTest(
+        *local_or);
+
+    ON_CALL(callbacks_, dispatcher()).WillByDefault(ReturnRef(dispatcher_));
+
+    factory_ = [this](bool, const void*, uint16_t, const void*, uint16_t)
+        -> QosmosClassifierPtr {
+      if (skip_factory_) return nullptr;
+      factory_invoked_++;
+      auto m = std::make_unique<MockQosmosClassifier>();
+      m->flow_alive_ = true;
+      m->result_ = next_result_;
+      m->external_destroyed_flag_ = &saw_destruction_;
+      captured_mock_ = m.get();
+      return m;
+    };
+
+    envoy::extensions::filters::listener::qosmos_dpi::v3::QosmosDpi proto =
+        defaultProto();
+    proto.set_verdict_cache_correction_enabled(true);
+    proto.set_verdict_cache_max_entries(100);
+    config_ = std::make_shared<Config>(proto, factory_, table_,
+                                        *stats_store_.rootScope(),
+                                        cache_.get());
+  }
+
+  Extensions::Common::QosmosDpi::VerdictCacheKey expectedKey() const {
+    Extensions::Common::QosmosDpi::VerdictCacheKey k;
+    k.dst_ip = "10.10.2.2";
+    k.dst_port = 80;
+    k.kind = Extensions::Common::QosmosDpi::DiscriminatorKind::Plain;
+    return k;
+  }
+
+  std::string verdictCluster() {
+    auto* obj = callbacks_.filter_state_
+        .getDataReadOnly<TcpProxy::PerConnectionCluster>(
+            TcpProxy::PerConnectionCluster::key());
+    return obj == nullptr ? std::string{} : obj->value();
+  }
+
+  Extensions::Common::QosmosDpi::QosmosFlowHandoff* getHandoff() {
+    return callbacks_.filter_state_
+        .getDataMutable<Extensions::Common::QosmosDpi::QosmosFlowHandoff>(
+            Extensions::Common::QosmosDpi::QosmosFlowHandoff::filterStateKey());
+  }
+
+  std::shared_ptr<ProtocolTable> table_;
+  std::unique_ptr<Extensions::Common::QosmosDpi::VerdictCache> cache_;
+  ConfigSharedPtr config_;
+  Stats::IsolatedStoreImpl stats_store_;
+
+  ClassifierFactory factory_;
+  ClassifyResult next_result_{};
+  bool skip_factory_{false};
+  int factory_invoked_{0};
+  MockQosmosClassifier* captured_mock_{nullptr};
+  bool saw_destruction_{false};
+
+  NiceMock<Event::MockDispatcher> dispatcher_;
+  NiceMock<Network::MockListenerFilterCallbacks> callbacks_;
+  std::unique_ptr<Filter> filter_;
+};
+
+TEST_F(QosmosDpiCacheFilterTest, OnAcceptCacheHitSkipsClassifierFactory) {
+  // Pre-populate the cache with a web verdict for 10.10.2.2:80.
+  ASSERT_TRUE(cache_->put(expectedKey(), /*verdict_is_web=*/true, "4pkt"));
+
+  filter_ = std::make_unique<Filter>(config_);
+  // Cache HIT branch returns Continue directly from onAccept.
+  EXPECT_EQ(filter_->onAccept(callbacks_),
+            Network::FilterStatus::Continue);
+  EXPECT_EQ(verdictCluster(), "web_cluster");
+  EXPECT_EQ(config_->stats().verdict_cache_hit_.value(), 1);
+  EXPECT_EQ(config_->stats().verdict_cache_miss_.value(), 0);
+  EXPECT_EQ(config_->stats().web_classified_.value(), 1);
+  // Classifier factory MUST NOT have been called on a hit.
+  EXPECT_EQ(factory_invoked_, 0);
+  EXPECT_EQ(captured_mock_, nullptr);
+}
+
+TEST_F(QosmosDpiCacheFilterTest, OnAcceptCacheMissRunsClassifier) {
+  next_result_.intermediate_path = "base.ip.tcp.http";
+
+  filter_ = std::make_unique<Filter>(config_);
+  EXPECT_EQ(filter_->onAccept(callbacks_),
+            Network::FilterStatus::StopIteration);
+  EXPECT_EQ(config_->stats().verdict_cache_miss_.value(), 1);
+  EXPECT_EQ(config_->stats().verdict_cache_hit_.value(), 0);
+  EXPECT_EQ(factory_invoked_, 1);
+}
+
+TEST_F(QosmosDpiCacheFilterTest, OnDataPopulatesCacheAndHandsOff) {
+  next_result_.intermediate_path = "base.ip.tcp.http";
+  next_result_.final_state = false;   // NOT final_state — expect hand-off.
+
+  filter_ = std::make_unique<Filter>(config_);
+  ASSERT_EQ(filter_->onAccept(callbacks_),
+            Network::FilterStatus::StopIteration);
+
+  FakeListenerFilterBuffer fb("GET / HTTP/1.1\r\n\r\n");
+  ASSERT_EQ(filter_->onData(fb), Network::FilterStatus::Continue);
+
+  // Verdict: web, cache populated.
+  EXPECT_EQ(verdictCluster(), "web_cluster");
+  EXPECT_EQ(config_->stats().web_classified_.value(), 1);
+  auto hit = cache_->lookup(expectedKey());
+  ASSERT_TRUE(hit.has_value());
+  EXPECT_TRUE(hit->verdict_is_web);
+  EXPECT_EQ(hit->source, "4pkt");
+  // Hand-off: FilterState has the object, and it holds the moved-out
+  // classifier (not the listener filter).
+  auto* handoff = getHandoff();
+  ASSERT_NE(handoff, nullptr);
+  ASSERT_TRUE(handoff->initialVerdictIsWeb().has_value());
+  EXPECT_TRUE(*handoff->initialVerdictIsWeb());
+  EXPECT_EQ(handoff->bytesAlreadyConsumed(),
+            std::string("GET / HTTP/1.1\r\n\r\n").size());
+  EXPECT_EQ(config_->stats().handed_off_to_correction_.value(), 1);
+}
+
+TEST_F(QosmosDpiCacheFilterTest, OnDataFinalStateFinalizesWithoutHandoff) {
+  next_result_.intermediate_path = "base.ip.tcp.http";
+  next_result_.final_state = true;   // First PDU already conclusive.
+
+  filter_ = std::make_unique<Filter>(config_);
+  ASSERT_EQ(filter_->onAccept(callbacks_),
+            Network::FilterStatus::StopIteration);
+  FakeListenerFilterBuffer fb("GET / HTTP/1.1\r\n\r\n");
+  ASSERT_EQ(filter_->onData(fb), Network::FilterStatus::Continue);
+
+  // Verdict + cache populate happen as usual...
+  EXPECT_EQ(verdictCluster(), "web_cluster");
+  ASSERT_TRUE(cache_->lookup(expectedKey()).has_value());
+  // ...but NO hand-off (final_state short-circuits the hand-off path).
+  EXPECT_EQ(config_->stats().handed_off_to_correction_.value(), 0);
+  EXPECT_EQ(getHandoff(), nullptr);
+  ASSERT_NE(captured_mock_, nullptr);
+  // finalize() was called on the mock, so flow_alive_ flipped off.
+  EXPECT_FALSE(captured_mock_->flow_alive_);
+}
+
+TEST_F(QosmosDpiCacheFilterTest, InconclusiveVerdictIsNotCached) {
+  // Both paths empty → the filter defaults to non-web (CFW) BUT MUST NOT
+  // cache that guess. Caching an inconclusive default would suppress DPI
+  // on every future connection to the destination.
+  next_result_.intermediate_path = "";
+  next_result_.final_path = "";
+
+  filter_ = std::make_unique<Filter>(config_);
+  ASSERT_EQ(filter_->onAccept(callbacks_),
+            Network::FilterStatus::StopIteration);
+  FakeListenerFilterBuffer fb("\x00\x01\x02\x03");
+  ASSERT_EQ(filter_->onData(fb), Network::FilterStatus::Continue);
+
+  EXPECT_EQ(verdictCluster(), "cfw_cluster");
+  EXPECT_EQ(config_->stats().inconclusive_forced_cfw_.value(), 1);
+  // Cache SHOULD stay empty.
+  EXPECT_EQ(cache_->size(), 0U);
+  EXPECT_FALSE(cache_->lookup(expectedKey()).has_value());
+  // No hand-off either — we have no verdict to correct against.
+  EXPECT_EQ(config_->stats().handed_off_to_correction_.value(), 0);
+  EXPECT_EQ(getHandoff(), nullptr);
+}
+
+TEST_F(QosmosDpiCacheFilterTest, SilenceTimeoutHandsOffWithNulloptVerdict) {
+  // Silence-timeout path: no bytes ever fed, classifier still alive. The
+  // filter must park a QosmosFlowHandoff with initialVerdictIsWeb=nullopt
+  // (no verdict yet) so the correction filter can populate the cache
+  // later if it reaches a real classification.
+  Event::TimerCb captured_cb;
+  auto* timer = new NiceMock<Event::MockTimer>();
+  EXPECT_CALL(dispatcher_, createTimer_(_))
+      .WillOnce([&captured_cb, timer](Event::TimerCb cb) {
+        captured_cb = std::move(cb);
+        return timer;
+      });
+  bool continue_called = false;
+  EXPECT_CALL(callbacks_, continueFilterChain(true))
+      .WillOnce([&continue_called](bool) { continue_called = true; });
+
+  filter_ = std::make_unique<Filter>(config_);
+  ASSERT_EQ(filter_->onAccept(callbacks_),
+            Network::FilterStatus::StopIteration);
+  ASSERT_TRUE(captured_cb != nullptr);
+  captured_cb();   // fire silence timer.
+
+  // Fallback verdict is non-web.
+  EXPECT_EQ(verdictCluster(), "cfw_cluster");
+  EXPECT_EQ(config_->stats().silence_timeout_.value(), 1);
+  EXPECT_TRUE(continue_called);
+
+  // Hand-off happened WITH nullopt verdict.
+  auto* handoff = getHandoff();
+  ASSERT_NE(handoff, nullptr);
+  EXPECT_FALSE(handoff->initialVerdictIsWeb().has_value());
+  EXPECT_EQ(handoff->bytesAlreadyConsumed(), 0U);
+  EXPECT_EQ(config_->stats().handed_off_to_correction_.value(), 1);
+  // Cache stays empty on the silence path — we don't cache the guess.
+  EXPECT_EQ(cache_->size(), 0U);
+}
+
+TEST_F(QosmosDpiCacheFilterTest, DisabledCorrectionByteForByteIdentical) {
+  // Regression: when verdictCacheForThisThread() is null (e.g. proto flag
+  // off), the filter must behave exactly like the pre-cache implementation
+  // — no cache lookup, no populate, no hand-off, cache untouched. Prove
+  // that by rebuilding Config with a proto that leaves the flag off.
+  envoy::extensions::filters::listener::qosmos_dpi::v3::QosmosDpi proto =
+      defaultProto();
+  // No set_verdict_cache_correction_enabled — defaults to false.
+  auto disabled_config = std::make_shared<Config>(
+      proto, factory_, table_, *stats_store_.rootScope(), cache_.get());
+  ASSERT_EQ(disabled_config->verdictCacheForThisThread(), nullptr);
+
+  next_result_.intermediate_path = "base.ip.tcp.http";
+  filter_ = std::make_unique<Filter>(disabled_config);
+  ASSERT_EQ(filter_->onAccept(callbacks_),
+            Network::FilterStatus::StopIteration);
+  FakeListenerFilterBuffer fb("GET / HTTP/1.1\r\n\r\n");
+  ASSERT_EQ(filter_->onData(fb), Network::FilterStatus::Continue);
+
+  EXPECT_EQ(verdictCluster(), "web_cluster");
+  // ZERO cache activity.
+  EXPECT_EQ(disabled_config->stats().verdict_cache_hit_.value(), 0);
+  EXPECT_EQ(disabled_config->stats().verdict_cache_miss_.value(), 0);
+  EXPECT_EQ(disabled_config->stats().handed_off_to_correction_.value(), 0);
+  EXPECT_EQ(cache_->size(), 0U);
+  EXPECT_EQ(getHandoff(), nullptr);
 }
 
 }  // namespace
