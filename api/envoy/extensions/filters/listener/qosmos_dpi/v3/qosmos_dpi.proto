@@ -95,12 +95,25 @@ message QosmosDpi {
   // the flow at connection close.
   bool verdict_cache_correction_enabled = 10;
 
-  // Maximum entries in the per-worker verdict cache. 0 ⇒ use built-in
-  // default (100000). Only meaningful when
-  // ``verdict_cache_correction_enabled`` is true. No TTL/expiry in this
-  // phase — a full cache rejects new keys (stat ``verdict_cache_reject_full``)
-  // rather than evicting.
-  uint32 verdict_cache_max_entries = 11;
+  // Total verdict-cache entries to allocate across all Envoy worker
+  // threads. The per-worker cap is derived as
+  // ``ceil(verdict_cache_total_entries / nb_workers)``, matching the
+  // divide-by-workers shape of ``total_nb_flows`` below.
+  //
+  // 0 ⇒ use built-in default 100000 **applied per worker** (i.e. the
+  // built-in default deliberately does not divide, so early
+  // deployments get a generous cache without having to set anything
+  // explicitly). Set this field to any non-zero value to switch to
+  // total-across-workers accounting.
+  //
+  // Only meaningful when ``verdict_cache_correction_enabled`` is true.
+  // No TTL/expiry in this phase — a full cache rejects new keys (stat
+  // ``verdict_cache_reject_full``) rather than evicting.
+  //
+  // Memory planning: each cache entry is ~60–100 bytes (two
+  // ``std::string`` + fixed members). 100000 total ⇒ ~10 MB total for
+  // the cache. See design.md §9 for the full memory table.
+  uint32 verdict_cache_total_entries = 11;
 
   // Total number of concurrent Qosmos flow contexts to reserve across all
   // Envoy worker threads. The engine's per-worker ``nb_flows`` config knob
