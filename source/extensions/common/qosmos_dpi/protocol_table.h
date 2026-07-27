@@ -12,7 +12,7 @@
 
 namespace Envoy {
 namespace Extensions {
-namespace ListenerFilters {
+namespace Common {
 namespace QosmosDpi {
 
 // Hooks captured per-flow by the Qosmos engine: e.g. {"ssl:alpn": "h2"}.
@@ -72,6 +72,6 @@ private:
 };
 
 }  // namespace QosmosDpi
-}  // namespace ListenerFilters
+}  // namespace Common
 }  // namespace Extensions
 }  // namespace Envoy

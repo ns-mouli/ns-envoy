@@ -8,7 +8,7 @@
 
 #include "source/common/protobuf/utility.h"
 #include "source/extensions/filters/listener/qosmos_dpi/qosmos_dpi.h"
-#include "source/extensions/filters/listener/qosmos_dpi/qosmos_engine.h"
+#include "source/extensions/common/qosmos_dpi/qosmos_engine.h"
 
 namespace Envoy {
 namespace Extensions {

@@ -1,4 +1,4 @@
-#include "source/extensions/filters/listener/qosmos_dpi/protocol_table.h"
+#include "source/extensions/common/qosmos_dpi/protocol_table.h"
 
 #include <fstream>
 #include <sstream>
@@ -11,7 +11,7 @@
 
 namespace Envoy {
 namespace Extensions {
-namespace ListenerFilters {
+namespace Common {
 namespace QosmosDpi {
 
 namespace {
@@ -220,6 +220,6 @@ std::optional<bool> ProtocolTable::isWeb(absl::string_view path,
 }
 
 }  // namespace QosmosDpi
-}  // namespace ListenerFilters
+}  // namespace Common
 }  // namespace Extensions
 }  // namespace Envoy

@@ -1,7 +1,7 @@
 #include <fstream>
 #include <string>
 
-#include "source/extensions/filters/listener/qosmos_dpi/protocol_table.h"
+#include "source/extensions/common/qosmos_dpi/protocol_table.h"
 
 #include "test/test_common/environment.h"
 
@@ -9,7 +9,7 @@
 
 namespace Envoy {
 namespace Extensions {
-namespace ListenerFilters {
+namespace Common {
 namespace QosmosDpi {
 namespace {
 
@@ -212,6 +212,6 @@ TEST_F(ProtocolTableTest, MissingProtocolsArrayReturnsError) {
 
 }  // namespace
 }  // namespace QosmosDpi
-}  // namespace ListenerFilters
+}  // namespace Common
 }  // namespace Extensions
 }  // namespace Envoy

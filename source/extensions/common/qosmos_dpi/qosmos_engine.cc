@@ -1,4 +1,4 @@
-#include "source/extensions/filters/listener/qosmos_dpi/qosmos_engine.h"
+#include "source/extensions/common/qosmos_dpi/qosmos_engine.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -18,7 +18,7 @@ extern "C" {
 
 namespace Envoy {
 namespace Extensions {
-namespace ListenerFilters {
+namespace Common {
 namespace QosmosDpi {
 
 QosmosWorker::QosmosWorker(qmdpi_engine* engine) {
@@ -502,6 +502,6 @@ QosmosClassifierPtr QosmosEngine::makeClassifier(bool is_v6, const void* src_ip,
 }
 
 }  // namespace QosmosDpi
-}  // namespace ListenerFilters
+}  // namespace Common
 }  // namespace Extensions
 }  // namespace Envoy

@@ -10,7 +10,7 @@
 #include "source/common/stream_info/filter_state_impl.h"
 #include "source/common/tcp_proxy/tcp_proxy.h"
 #include "source/extensions/filters/listener/qosmos_dpi/qosmos_dpi.h"
-#include "source/extensions/filters/listener/qosmos_dpi/qosmos_engine.h"
+#include "source/extensions/common/qosmos_dpi/qosmos_engine.h"
 
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/network/mocks.h"

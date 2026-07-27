@@ -13,7 +13,7 @@ envoy_cc_test(
     srcs = ["protocol_table_test.cc"],
     rbe_pool = "6gig",
     deps = [
-        "//source/extensions/filters/listener/qosmos_dpi:protocol_table_lib",
+        "//source/extensions/common/qosmos_dpi:protocol_table_lib",
         "//test/test_common:environment_lib",
     ],
 )
