@@ -157,7 +157,8 @@ public:
                const std::string& table_path,
                uint32_t nb_workers,
                ThreadLocal::SlotAllocator& tls,
-               uint32_t verdict_cache_max_entries = 0);
+               uint32_t verdict_cache_max_entries = 0,
+               uint32_t total_nb_flows = 0);
 
   ~QosmosEngine() override;
 
@@ -190,9 +191,13 @@ public:
 private:
   // Build the engine_config string that gets passed to qmdpi_engine_create.
   // If `user_supplied` is non-empty, returns it verbatim; otherwise
-  // synthesises the default stream-mode config.
+  // synthesises the default stream-mode config. `total_nb_flows` is the
+  // process-wide flow-context budget; the per-worker `nb_flows` argument
+  // is derived as ceil(total_nb_flows / (nb_workers + 1)). 0 ⇒ use
+  // built-in default (300000).
   static std::string resolveEngineConfig(const std::string& user_supplied,
-                                          uint32_t nb_workers);
+                                          uint32_t nb_workers,
+                                          uint32_t total_nb_flows);
 
   qmdpi_engine* engine_{};
   qmdpi_bundle* bundle_{};
