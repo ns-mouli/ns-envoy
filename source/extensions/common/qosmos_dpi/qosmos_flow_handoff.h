@@ -60,7 +60,7 @@ public:
   // most once from Filter::onNewConnection; a second call returns nullptr.
   QosmosClassifierPtr release() { return std::move(classifier_); }
 
-  const VerdictCacheKey& key() const { return key_; }
+  const VerdictCacheKey& cacheKey() const { return key_; }
   absl::optional<bool> initialVerdictIsWeb() const {
     return initial_verdict_is_web_;
   }
@@ -69,7 +69,7 @@ public:
 
   // FilterState key. Static-storage duration string so its address is
   // stable across the lifetime of the process.
-  static const std::string& key() {
+  static const std::string& filterStateKey() {
     static const std::string* k =
         new std::string("envoy.extensions.common.qosmos_dpi.flow_handoff");
     return *k;

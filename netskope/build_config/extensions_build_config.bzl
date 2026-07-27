@@ -56,12 +56,12 @@ EXTENSIONS = {
     "envoy.filters.listener.original_dst":              "//source/extensions/filters/listener/original_dst:config",
     "envoy.filters.listener.tls_inspector":             "//source/extensions/filters/listener/tls_inspector:config",
     "envoy.filters.listener.qosmos_dpi":                "//source/extensions/filters/listener/qosmos_dpi:config",
-    # Add qosmos_dpi_correction here once its BUILD lands (verdict-cache plan Part G):
-    # "envoy.filters.network.qosmos_dpi_correction":  "//source/extensions/filters/network/qosmos_dpi_correction:config",
 
     #
-    # Network filters -- ONLY tcp_proxy
+    # Network filters -- tcp_proxy + qosmos_dpi_correction (Part E of the
+    # verdict-cache plan)
     #
+    "envoy.filters.network.qosmos_dpi_correction":                "//source/extensions/filters/network/qosmos_dpi_correction:config",
     "envoy.filters.network.tcp_proxy":                            "//source/extensions/filters/network/tcp_proxy:config",
 
     #

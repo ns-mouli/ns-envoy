@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.network.qosmos_dpi_correction.v3;
+
+import "google/protobuf/duration.proto";
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.network.qosmos_dpi_correction.v3";
+option java_outer_classname = "QosmosDpiCorrectionProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/qosmos_dpi_correction/v3;qosmos_dpi_correctionv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc-title: Qosmos DPI Verdict-Cache Correction Network Filter]
+// Companion to ``envoy.filters.listener.qosmos_dpi``. Claims the live
+// ``qmdpi_flow`` handed off by the listener filter via ``StreamInfo::FilterState``
+// (``QosmosFlowHandoff``, ``LifeSpan::Connection``), keeps feeding bytes past
+// the 4-packet cascade boundary in both directions until Qosmos reaches
+// ``QMDPI_RESULT_FLAGS_CLASSIFIED_FINAL_STATE`` or a resource bound trips,
+// then re-runs the cascade and corrects the per-worker verdict cache if the
+// verdict flipped.
+//
+// The current connection's routing is NOT redirected — ``tcp_proxy`` has
+// already dialed the initial cluster by the time this filter starts
+// observing bytes. Only FUTURE connections to the same destination benefit
+// from the corrected cache entry.
+//
+// If no ``QosmosFlowHandoff`` object is present in ``FilterState`` at
+// ``onNewConnection()`` (cache disabled, listener filter absent, or a cache-
+// hit path that skipped hand-off), this filter is a permanent zero-cost
+// passthrough for the connection.
+//
+// [#extension: envoy.filters.network.qosmos_dpi_correction]
+
+// [#next-free-field: 4]
+message QosmosDpiCorrection {
+  // Upper bound on how long this filter will keep a handed-off classifier
+  // alive before force-finalizing it. Prevents a slow / never-terminating
+  // flow from holding engine state indefinitely. Default 5s.
+  //
+  // Three orders of magnitude shorter than ``tcp_proxy``'s own default
+  // ``idle_timeout`` (1 h when unset), so this bound always fires first
+  // and the correction filter never has to arbitrate against
+  // ``tcp_proxy``'s teardown.
+  google.protobuf.Duration correction_timeout = 1;
+
+  // Upper bound on bytes fed to ``classifyPdu`` after the hand-off. 0 ⇒
+  // use built-in default 65536.
+  uint32 max_correction_bytes = 2;
+
+  // Upper bound on ``classifyPdu`` invocations after the hand-off (one per
+  // ``onData`` / ``onWrite`` chunk that carries genuinely-new bytes). 0 ⇒
+  // use built-in default 64.
+  uint32 max_correction_pdus = 3;
+}
