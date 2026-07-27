@@ -112,9 +112,13 @@ public:
          Stats::Scope& scope);
 
   // Test-only constructor: inject a mock classifier factory and bypass
-  // QosmosEngine entirely. The protocol table is provided directly.
+  // QosmosEngine entirely. The protocol table is provided directly. An
+  // optional VerdictCache can be attached; when non-null the filter's
+  // cache/handoff branches fire as if a real engine were behind them.
+  // Owned by the caller — must outlive this Config.
   Config(const ProtoConfig& proto, ClassifierFactory factory,
-         std::shared_ptr<ProtocolTable> table, Stats::Scope& scope);
+         std::shared_ptr<ProtocolTable> table, Stats::Scope& scope,
+         Extensions::Common::QosmosDpi::VerdictCache* test_verdict_cache = nullptr);
 
   // The cascade lookup table. In production the engine owns it; in tests
   // we override via the second constructor. Always non-null after Config
@@ -142,6 +146,13 @@ public:
   // Config already owns the QosmosEngine shared_ptr.
   QosmosEngine* engine() const { return engine_.get(); }
 
+  // Returns the VerdictCache the filter should use for THIS worker thread
+  // (production: engine_->cacheForThisThread() when the engine has the
+  // cache enabled; tests: the test_verdict_cache passed to the test-only
+  // ctor). Returns nullptr when the cache is disabled or the config is
+  // production without a live engine cache — callers must null-check.
+  Extensions::Common::QosmosDpi::VerdictCache* verdictCacheForThisThread() const;
+
   QosmosDpiStats& stats() { return stats_; }
 
 private:
@@ -159,6 +170,7 @@ private:
   uint32_t max_inspect_bytes_;
   bool close_on_engine_error_;
   bool verdict_cache_correction_enabled_{false};
+  Extensions::Common::QosmosDpi::VerdictCache* test_verdict_cache_{nullptr};
   QosmosDpiStats stats_;
 };
 

@@ -137,7 +137,8 @@ const ProtocolTable& Config::table() const {
 }
 
 Config::Config(const ProtoConfig& proto, ClassifierFactory factory,
-               std::shared_ptr<ProtocolTable> table, Stats::Scope& scope)
+               std::shared_ptr<ProtocolTable> table, Stats::Scope& scope,
+               Extensions::Common::QosmosDpi::VerdictCache* test_verdict_cache)
     : engine_(nullptr),
       table_(std::move(table)),
       classifier_factory_(std::move(factory)),
@@ -151,7 +152,16 @@ Config::Config(const ProtoConfig& proto, ClassifierFactory factory,
                                                         : proto.max_inspect_bytes()),
       close_on_engine_error_(proto.close_on_engine_error()),
       verdict_cache_correction_enabled_(proto.verdict_cache_correction_enabled()),
+      test_verdict_cache_(test_verdict_cache),
       stats_(generateStats(scope)) {}
+
+Extensions::Common::QosmosDpi::VerdictCache*
+Config::verdictCacheForThisThread() const {
+  if (!verdict_cache_correction_enabled_) return nullptr;
+  if (test_verdict_cache_ != nullptr) return test_verdict_cache_;
+  if (engine_ == nullptr || !engine_->verdictCacheEnabled()) return nullptr;
+  return &engine_->cacheForThisThread();
+}
 
 // ──────────────── Filter ────────────────
 
@@ -204,14 +214,12 @@ Network::FilterStatus Filter::onAccept(Network::ListenerFilterCallbacks& cb) {
   // the cache and hand off the flow to the correction filter.
   //
   // When disabled, cache_key_ stays empty and every branch below (which
-  // gates on !cache_key_.dst_ip.empty() && config_->verdictCacheCorrectionEnabled())
+  // gates on !cache_key_.dst_ip.empty() && verdictCacheForThisThread())
   // behaves exactly as today.
-  if (config_->verdictCacheCorrectionEnabled() && config_->engine() != nullptr &&
-      config_->engine()->verdictCacheEnabled()) {
+  if (auto* cache = config_->verdictCacheForThisThread(); cache != nullptr) {
     cache_key_ = computeCacheKey(info);
     if (!cache_key_.dst_ip.empty()) {
-      auto& cache = config_->engine()->cacheForThisThread();
-      auto hit = cache.lookup(cache_key_);
+      auto hit = cache->lookup(cache_key_);
       if (hit.has_value()) {
         config_->stats().verdict_cache_hit_.inc();
         const auto& cluster = hit->verdict_is_web ? config_->webCluster()
@@ -272,9 +280,8 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
   const auto slice = buffer.rawSlice();
   config_->stats().bytes_processed_.recordValue(static_cast<uint64_t>(slice.len_));
 
-  const bool correction_enabled =
-      config_->verdictCacheCorrectionEnabled() && config_->engine() != nullptr &&
-      config_->engine()->verdictCacheEnabled() && !cache_key_.dst_ip.empty();
+  auto* cache = config_->verdictCacheForThisThread();
+  const bool correction_enabled = cache != nullptr && !cache_key_.dst_ip.empty();
 
   // When correction is enabled we call classifyPdu (no flow_destroy) so
   // the correction network filter can keep feeding the same flow past the
@@ -339,11 +346,10 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
   // "we had no signal, defaulted to non-web" would poison the cache and
   // suppress every future connection's DPI on that destination.
   if (correction_enabled && verdict.has_value() && cb_ != nullptr) {
-    auto& cache = config_->engine()->cacheForThisThread();
-    if (!cache.put(cache_key_, verdict_is_web, "4pkt")) {
+    if (!cache->put(cache_key_, verdict_is_web, "4pkt")) {
       config_->stats().verdict_cache_reject_full_.inc();
     }
-    config_->stats().verdict_cache_size_.set(cache.size());
+    config_->stats().verdict_cache_size_.set(cache->size());
 
     if (cr.final_state) {
       // Rare: the engine already reached a final classification on this
@@ -381,9 +387,9 @@ void Filter::onSilenceTimeout() {
   config_->stats().silence_timeout_.inc();
 
   const bool correction_enabled =
-      config_->verdictCacheCorrectionEnabled() && config_->engine() != nullptr &&
-      config_->engine()->verdictCacheEnabled() && !cache_key_.dst_ip.empty() &&
-      classifier_ != nullptr && classifier_->flowAlive() && cb_ != nullptr;
+      config_->verdictCacheForThisThread() != nullptr &&
+      !cache_key_.dst_ip.empty() && classifier_ != nullptr &&
+      classifier_->flowAlive() && cb_ != nullptr;
 
   // When correction is enabled, hand off the live-but-fed-nothing classifier
   // before setting the fallback verdict. The correction filter will see
