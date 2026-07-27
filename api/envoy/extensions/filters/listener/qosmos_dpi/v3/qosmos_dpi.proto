@@ -32,7 +32,7 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 //
 // [#extension: envoy.filters.listener.qosmos_dpi]
 
-// [#next-free-field: 10]
+// [#next-free-field: 12]
 message QosmosDpi {
   // Path to the Qosmos engine config file. If empty, the filter synthesises
   // ``"injection_mode=stream;nb_workers=N"`` where N matches Envoy's worker
@@ -76,4 +76,29 @@ message QosmosDpi {
   // If true, refuse the connection on Qosmos engine error. Default false ⇒
   // fail-open: route to ``non_web_cluster``. Production default.
   bool close_on_engine_error = 9;
+
+  // Enable the verdict-cache + self-correction hand-off. When true:
+  //
+  // * ``onAccept`` looks up the destination in a per-worker verdict cache
+  //   before creating a Qosmos flow. On hit, ``PerConnectionCluster`` is set
+  //   from the cached verdict and no DPI runs at all.
+  // * On miss, the 4-packet cascade runs as today, populates the cache, and
+  //   the still-alive ``qmdpi_flow`` is handed off (via ``StreamInfo::FilterState``)
+  //   to the companion ``envoy.filters.network.qosmos_dpi_correction`` network
+  //   filter so it can keep feeding bytes past the 4-packet boundary and correct
+  //   the cache when Qosmos reaches a fuller classification.
+  //
+  // Default false — fully additive; existing always-destroy-on-first-PDU
+  // behaviour is unchanged when this is false. Requires the correction
+  // network filter to be present in ``filter_chains`` for the hand-off to be
+  // consumed; if absent, the ``QosmosFlowHandoff`` object simply RAII-destroys
+  // the flow at connection close.
+  bool verdict_cache_correction_enabled = 10;
+
+  // Maximum entries in the per-worker verdict cache. 0 ⇒ use built-in
+  // default (100000). Only meaningful when
+  // ``verdict_cache_correction_enabled`` is true. No TTL/expiry in this
+  // phase — a full cache rejects new keys (stat ``verdict_cache_reject_full``)
+  // rather than evicting.
+  uint32 verdict_cache_max_entries = 11;
 }

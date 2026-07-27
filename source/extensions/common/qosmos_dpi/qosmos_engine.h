@@ -18,6 +18,8 @@ namespace Extensions {
 namespace Common {
 namespace QosmosDpi {
 
+class VerdictCache;
+
 // Result of a single first-PDU classification round: the engine's
 // intermediate path (from qmdpi_worker_process) and the final path
 // (from qmdpi_flow_destroy out-param). Either may be empty.
@@ -31,13 +33,18 @@ struct ClassifyResult {
   Hooks hooks;
   bool engine_error{false};   // true if qmdpi_worker_pdu_set or
                               // qmdpi_worker_process returned non-zero.
+  // True iff the engine set QMDPI_RESULT_FLAGS_CLASSIFIED_FINAL_STATE on this
+  // classify. Only ever set by classifyPdu() (which does not destroy the
+  // flow); classifyFirstPdu() and finalize() always leave this false because
+  // the finality signal is only meaningful before the destroy call.
+  bool final_state{false};
 };
 
 // Per-connection classification transaction. Owns a qmdpi_flow* via
 // RAII: created at construction time (or nullptr on failure), destroyed
-// either by `classifyFirstPdu()` (the verdict path) or by `~QosmosClassifier`
-// (the silence-timeout / on-close path). Either way, qmdpi_flow_destroy
-// is called exactly once per successfully-created flow.
+// either by `classifyFirstPdu()` / `finalize()` (the verdict paths) or by
+// `~QosmosClassifier` (the silence-timeout / on-close path). Either way,
+// qmdpi_flow_destroy is called exactly once per successfully-created flow.
 //
 // Filter holds a `std::unique_ptr<QosmosClassifier>` per accepted
 // connection. Tests substitute a MockQosmosClassifier that returns
@@ -47,20 +54,49 @@ public:
   virtual ~QosmosClassifier() = default;
 
   // Whether the underlying qmdpi_flow* was created successfully and is
-  // still alive (i.e. classifyFirstPdu hasn't been called yet AND the
+  // still alive (i.e. finalize() hasn't been called yet AND the
   // constructor didn't fail). False ⇒ the connection should fail-safe
   // to non-web.
   virtual bool flowAlive() const PURE;
 
-  // Single-shot classify. Feeds `bytes`/`len` to qmdpi_worker_pdu_set,
-  // runs qmdpi_worker_process to get the intermediate path, then
-  // UNCONDITIONALLY calls qmdpi_flow_destroy to get the final path
-  // and release engine-side state. After this returns, flowAlive()
-  // returns false and subsequent calls are no-ops returning empty
-  // ClassifyResult{}.
-  virtual ClassifyResult classifyFirstPdu(const void* bytes, int len,
-                                          int direction,
-                                          int tenant_id) PURE;
+  // Feed one PDU to the engine. Does NOT destroy the flow — the flow stays
+  // alive (flowAlive() remains true) for a subsequent call. Sets
+  // result.final_state from QMDPI_RESULT_FLAGS_CLASSIFIED_FINAL_STATE and
+  // populates result.intermediate_path + result.hooks. result.final_path
+  // is always empty on this path (the final path is a qmdpi_flow_destroy
+  // out-param, and destroy hasn't happened).
+  //
+  // The listener filter calls this at most once (for the initial verdict);
+  // the correction network filter calls it repeatedly afterward on the
+  // SAME classifier instance.
+  virtual ClassifyResult classifyPdu(const void* bytes, int len, int direction,
+                                     int tenant_id) PURE;
+
+  // Idempotent teardown: qmdpi_flow_destroy, flow_ = nullptr. Extracts the
+  // final path + hooks from the destroy out-param and returns them via
+  // ClassifyResult (intermediate_path always empty on this path).
+  // After this returns, flowAlive() returns false and further classifyPdu
+  // calls are no-ops returning ClassifyResult{engine_error=true}.
+  virtual ClassifyResult finalize() PURE;
+
+  // Convenience wrapper: classifyPdu + finalize, merged. This is the
+  // pre-cache single-shot path — the listener filter uses it when
+  // verdict_cache_correction_enabled is false (default), preserving today's
+  // "destroy on first PDU" behaviour byte-for-byte. It also lets tests /
+  // mocks that only cared about the merged shape keep working unchanged.
+  // Non-virtual by design — implementations override the two primitives.
+  ClassifyResult classifyFirstPdu(const void* bytes, int len, int direction,
+                                   int tenant_id) {
+    ClassifyResult cr = classifyPdu(bytes, len, direction, tenant_id);
+    ClassifyResult final_cr = finalize();
+    cr.final_path = std::move(final_cr.final_path);
+    for (auto& kv : final_cr.hooks) {
+      cr.hooks.try_emplace(kv.first, std::move(kv.second));
+    }
+    if (final_cr.engine_error) cr.engine_error = true;
+    cr.final_state = false;   // finality-signal is meaningless post-destroy.
+    return cr;
+  }
 };
 
 using QosmosClassifierPtr = std::unique_ptr<QosmosClassifier>;
@@ -120,7 +156,8 @@ public:
                const std::string& bundle_path,
                const std::string& table_path,
                uint32_t nb_workers,
-               ThreadLocal::SlotAllocator& tls);
+               ThreadLocal::SlotAllocator& tls,
+               uint32_t verdict_cache_max_entries = 0);
 
   ~QosmosEngine() override;
 
@@ -130,6 +167,13 @@ public:
   // Must be called from a worker thread (i.e. inside an Envoy filter
   // callback) — the underlying TypedSlot<>::get() asserts this.
   QosmosWorker& workerForThisThread();
+
+  // Returns the VerdictCache bound to the calling Envoy worker thread.
+  // Same call-site restriction as workerForThisThread(). Non-null iff
+  // verdict_cache_max_entries was non-zero at construction; callers must
+  // check via verdictCacheEnabled() before dereferencing.
+  bool verdictCacheEnabled() const { return cache_slot_ != nullptr; }
+  VerdictCache& cacheForThisThread();
 
   // Factory: build a QosmosClassifier for one connection. The classifier
   // calls qmdpi_flow_create internally during construction. Returns nullptr
@@ -154,6 +198,11 @@ private:
   qmdpi_bundle* bundle_{};
   std::unique_ptr<ProtocolTable> table_;
   ThreadLocal::TypedSlotPtr<QosmosWorker> worker_slot_;
+  // Non-null iff the verdict cache is enabled (max_entries > 0). Kept as a
+  // TypedSlotPtr rather than a TypedSlot so a null cache_slot_ is a
+  // zero-cost signal that the cache is off; the correction filter's
+  // per-worker cacheForThisThread() calls flow through this same slot.
+  ThreadLocal::TypedSlotPtr<VerdictCache> cache_slot_;
 
   // Cascade rules 0/1 consume `ssl:alpn`. We register that attribute at
   // init time and cache its (proto_id, attr_id) integer pair so the
