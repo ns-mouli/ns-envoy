@@ -142,33 +142,68 @@ QosmosEngine::QosmosEngine(const std::string& engine_config,
         "qosmos_dpi: qmdpi_bundle_signature_enable_all failed (rc=%d)", rc));
   }
 
-  // Register ssl:alpn for extraction. Cascade rules 0 (non-web ALPN
-  // beats everything) and 1 (transport-token + HTTP ALPN ⇒ web) consume
-  // it. Failure here is non-fatal — we log and proceed with ssl_proto_id_
-  // staying at -1, which makes the per-classify hook extraction a no-op.
-  // Cascade then runs with no ALPN signal: conservative — more flows go
-  // to non-web/CFW, but no incorrect web verdicts.
-  if (int rc = qmdpi_bundle_attr_register(bundle_, "ssl", "alpn"); rc != 0) {
-    ENVOY_LOG(warn, "qosmos_dpi: qmdpi_bundle_attr_register(ssl, alpn) "
-                     "returned {} — ALPN cascade rules will not fire", rc);
-  } else {
-    // Cache the integer (proto_id, attr_id) pair for fast match in the
-    // per-classify result iterator.
-    qmdpi_signature* ssl_sig = qmdpi_bundle_signature_get_byname(bundle_, "ssl");
-    qmdpi_attr* alpn_attr =
-        qmdpi_bundle_attr_get_byname(bundle_, "ssl", "alpn");
-    if (ssl_sig != nullptr && alpn_attr != nullptr) {
-      ssl_proto_id_ = qmdpi_signature_id_get(ssl_sig);
-      alpn_attr_id_ = qmdpi_attr_id_get(alpn_attr);
-      ENVOY_LOG(info, "qosmos_dpi: registered ssl:alpn extraction "
-                       "(proto_id={}, attr_id={})", ssl_proto_id_, alpn_attr_id_);
-    } else {
-      ENVOY_LOG(warn, "qosmos_dpi: could not resolve ssl:alpn ids "
-                       "(ssl_sig={}, alpn_attr={}) — ALPN cascade rules "
-                       "will not fire",
-                fmt::ptr(ssl_sig), fmt::ptr(alpn_attr));
+  // Register discriminator hooks for extraction. Failure of any one is
+  // non-fatal — the corresponding attr_id stays at -1 and the extractor
+  // simply skips it. Downstream behaviour degrades gracefully:
+  //   ssl:alpn missing  ⇒ cascade rules 0/1 don't fire (conservative,
+  //                       more flows to non-web).
+  //   ssl:server_name /
+  //   ssl:ja4          ⇒ TLS cache-key falls back to next-priority hint
+  //                       or Plain {dst-ip, dst-port} — cache still works,
+  //                       just with more collisions across shared IPs.
+  //   http:host        ⇒ cleartext HTTP cache-key falls back to Plain.
+  auto register_attr = [this](const char* proto, const char* attr,
+                              int& proto_id_out, int& attr_id_out,
+                              const char* extra_hint = nullptr) {
+    if (int rc = qmdpi_bundle_attr_register(bundle_, proto, attr); rc != 0) {
+      ENVOY_LOG(warn, "qosmos_dpi: qmdpi_bundle_attr_register({}, {}) "
+                       "returned {}{}",
+                proto, attr, rc,
+                extra_hint == nullptr ? "" : extra_hint);
+      return;
     }
+    qmdpi_signature* sig = qmdpi_bundle_signature_get_byname(bundle_, proto);
+    qmdpi_attr* a = qmdpi_bundle_attr_get_byname(bundle_, proto, attr);
+    if (sig != nullptr && a != nullptr) {
+      proto_id_out = qmdpi_signature_id_get(sig);
+      attr_id_out = qmdpi_attr_id_get(a);
+      ENVOY_LOG(info, "qosmos_dpi: registered {}:{} extraction "
+                       "(proto_id={}, attr_id={})",
+                proto, attr, proto_id_out, attr_id_out);
+    } else {
+      ENVOY_LOG(warn, "qosmos_dpi: could not resolve {}:{} ids "
+                       "(sig={}, attr={})",
+                proto, attr, fmt::ptr(sig), fmt::ptr(a));
+    }
+  };
+
+  // ssl:alpn — cascade rules 0/1 (see ProtocolTable::isWebWithRule).
+  register_attr("ssl", "alpn", ssl_proto_id_, alpn_attr_id_,
+                 " — ALPN cascade rules will not fire");
+  // ssl:server_name — TLS SNI (primary cache-key discriminator).
+  {
+    int discard_proto = -1;
+    register_attr("ssl", "server_name", discard_proto, sni_attr_id_,
+                   " — cache-key SNI discriminator disabled for TLS flows");
+    // ssl_proto_id_ was populated by the alpn call above; if that failed
+    // and this one succeeded, backfill from `discard_proto`.
+    if (ssl_proto_id_ < 0 && discard_proto >= 0) ssl_proto_id_ = discard_proto;
   }
+  // ssl:ja4 — TLS fingerprint fallback when SNI is absent (ECH etc).
+  // The Qosmos SDK's underlying enum is Q_SSL_FINGERPRINT_JA4, so the
+  // attribute-name string used with qmdpi_bundle_attr_register is
+  // "fingerprint_ja4" (the SDK follows the lower-cased enum-suffix-after-
+  // Q_SSL_ convention). Verified against the SDK's own examples on
+  // 2026-07-28 — a plain "ja4" register returns -1.
+  {
+    int discard_proto = -1;
+    register_attr("ssl", "fingerprint_ja4", discard_proto, ja4_attr_id_,
+                   " — cache-key JA4 discriminator disabled for TLS flows");
+    if (ssl_proto_id_ < 0 && discard_proto >= 0) ssl_proto_id_ = discard_proto;
+  }
+  // http:host — HTTP Host header / HTTP/2 :authority.
+  register_attr("http", "host", http_proto_id_, host_attr_id_,
+                 " — cache-key Host discriminator disabled for cleartext HTTP");
 
   // 3. Protocol table (CSV-derived JSON). Loaded right after bundle activate
   //    so that any hot-path lookup never has to NULL-check it.
@@ -319,19 +354,31 @@ struct SynthTcpHdr {
 static_assert(sizeof(SynthTcpHdr) == 20, "TCP header must be 20 bytes");
 #pragma pack(pop)
 
+// Cached attribute (proto_id, attr_id) pairs for the hooks we extract on
+// every classify. -1 in any field means that attribute wasn't registered
+// successfully at engine init; the extractor treats it as "skip".
+struct AttrIds {
+  int ssl_proto{-1};    // shared across alpn/sni/ja4 (they all live on ssl)
+  int alpn_attr{-1};
+  int sni_attr{-1};
+  int ja4_attr{-1};
+  int http_proto{-1};
+  int host_attr{-1};
+};
+
 class RealQosmosClassifier : public QosmosClassifier,
                               Logger::Loggable<Logger::Id::filter> {
 public:
-  // ssl_proto_id / alpn_attr_id of -1 disable hook extraction (cascade
-  // runs with empty Hooks; rules 0/1 don't fire). See QosmosEngine ctor
-  // for why those might be -1.
+  // Any negative id in `attr_ids` disables extraction of that specific
+  // hook — the classifier still runs and other hooks still work. See
+  // QosmosEngine ctor for why an id might be -1.
   RealQosmosClassifier(qmdpi_worker* worker, qmdpi_bundle* bundle,
-                        qmdpi_flow* flow, int ssl_proto_id, int alpn_attr_id,
+                        qmdpi_flow* flow, const AttrIds& attr_ids,
                         bool is_v6, const void* src_ip,
                         uint16_t src_port_nbo, const void* dst_ip,
                         uint16_t dst_port_nbo)
       : worker_(worker), bundle_(bundle), flow_(flow),
-        ssl_proto_id_(ssl_proto_id), alpn_attr_id_(alpn_attr_id),
+        attr_ids_(attr_ids),
         is_v4_(!is_v6) {
     // Cache the 5-tuple into pre-baked L3/L4 header buffers so the hot
     // path just hands their addresses to qmdpi_worker_pdu_header_set.
@@ -439,7 +486,7 @@ public:
       // Extract ssl:alpn from intermediate result. The TLS ClientHello
       // is the very first client byte stream, so ALPN is typically
       // available on the intermediate path already — before flow_destroy.
-      extractAlpn(intermediate, result.hooks);
+      extractDiscriminatorHooks(intermediate, result.hooks);
       // Finality signal: set iff the engine has decided nothing new will
       // change the classification given more bytes. Only meaningful on
       // this (pre-destroy) path.
@@ -477,47 +524,69 @@ public:
     if (final_result != nullptr) {
       qmdpi_path* p = qmdpi_result_path_get(final_result);
       result.final_path = pathToString(bundle_, p);
-      extractAlpn(final_result, result.hooks);
+      extractDiscriminatorHooks(final_result, result.hooks);
     }
     return result;
   }
 
 private:
-  // Walk qmdpi_result_attr_getnext on `result` and pluck out any
-  // ssl:alpn values, comma-joined into hooks["ssl:alpn"]. ALPN can have
-  // multiple registered values per flow (the client's full preference
-  // list); we join them with ", " to match the qosmos-poc cascade
-  // (run_tests.py:340 splits on ',' and trims).
-  void extractAlpn(qmdpi_result* result, Hooks& hooks) const {
-    if (result == nullptr || ssl_proto_id_ < 0 || alpn_attr_id_ < 0) {
-      return;
-    }
+  // Walk qmdpi_result_attr_getnext ONCE and pluck out every registered
+  // discriminator hook into `hooks`. Keys:
+  //   "ssl:alpn"         — cascade rules 0/1 consume this (may be multi-
+  //                        value; joined with ", " to match qosmos-poc's
+  //                        run_tests.py:340 splitter).
+  //   "ssl:server_name"  — TLS SNI, primary cache-key discriminator.
+  //   "ssl:ja4"          — TLS JA4 client fingerprint (SNI fallback).
+  //   "http:host"        — HTTP Host / HTTP2 :authority (cleartext HTTP
+  //                        cache discriminator).
+  //
+  // Attributes with alpn-style multi-value semantics (currently only ALPN)
+  // get comma-joined; single-value attributes (SNI/JA4/Host) are
+  // first-writer-wins — the first attr_getnext hit wins.
+  void extractDiscriminatorHooks(qmdpi_result* result, Hooks& hooks) const {
+    if (result == nullptr) return;
     int proto_id = 0, attr_id = 0, attr_flags = 0;
     int attr_len = 0;
     const char* attr_value = nullptr;
-    std::string joined;
+    std::string alpn_joined;
     while (qmdpi_result_attr_getnext(result, &proto_id, &attr_id,
                                       &attr_value, &attr_len,
                                       &attr_flags) == 0) {
-      if (proto_id != ssl_proto_id_ || attr_id != alpn_attr_id_) {
+      if (attr_value == nullptr || attr_len <= 0) continue;
+      const size_t len = static_cast<size_t>(attr_len);
+
+      // Attributes on the ssl protocol: alpn (multi-value), sni, ja4.
+      if (proto_id == attr_ids_.ssl_proto && attr_ids_.ssl_proto >= 0) {
+        if (attr_id == attr_ids_.alpn_attr && attr_ids_.alpn_attr >= 0) {
+          if (!alpn_joined.empty()) alpn_joined.append(", ");
+          alpn_joined.append(attr_value, len);
+          continue;
+        }
+        if (attr_id == attr_ids_.sni_attr && attr_ids_.sni_attr >= 0) {
+          hooks.try_emplace("ssl:server_name", std::string(attr_value, len));
+          continue;
+        }
+        if (attr_id == attr_ids_.ja4_attr && attr_ids_.ja4_attr >= 0) {
+          hooks.try_emplace("ssl:ja4", std::string(attr_value, len));
+          continue;
+        }
+      }
+      // Attribute on the http protocol: host.
+      if (proto_id == attr_ids_.http_proto && attr_ids_.http_proto >= 0 &&
+          attr_id == attr_ids_.host_attr && attr_ids_.host_attr >= 0) {
+        hooks.try_emplace("http:host", std::string(attr_value, len));
         continue;
       }
-      if (attr_value == nullptr || attr_len <= 0) {
-        continue;
-      }
-      if (!joined.empty()) joined.append(", ");
-      joined.append(attr_value, static_cast<size_t>(attr_len));
     }
-    if (!joined.empty()) {
-      hooks["ssl:alpn"] = std::move(joined);
+    if (!alpn_joined.empty()) {
+      hooks["ssl:alpn"] = std::move(alpn_joined);
     }
   }
 
   qmdpi_worker* worker_;
   qmdpi_bundle* bundle_;
   qmdpi_flow* flow_;
-  int ssl_proto_id_;
-  int alpn_attr_id_;
+  AttrIds attr_ids_;
   bool is_v4_;
   // Pre-baked synthesised inner-most headers, addresses fed to
   // qmdpi_worker_pdu_header_set on every classify call.
@@ -549,8 +618,15 @@ QosmosClassifierPtr QosmosEngine::makeClassifier(bool is_v6, const void* src_ip,
               errno, std::strerror(errno));
     return nullptr;
   }
+  AttrIds attr_ids;
+  attr_ids.ssl_proto = ssl_proto_id_;
+  attr_ids.alpn_attr = alpn_attr_id_;
+  attr_ids.sni_attr = sni_attr_id_;
+  attr_ids.ja4_attr = ja4_attr_id_;
+  attr_ids.http_proto = http_proto_id_;
+  attr_ids.host_attr = host_attr_id_;
   return std::make_unique<RealQosmosClassifier>(worker, bundle_, flow,
-                                                  ssl_proto_id_, alpn_attr_id_,
+                                                  attr_ids,
                                                   is_v6, src_ip, src_port_nbo,
                                                   dst_ip, dst_port_nbo);
 }

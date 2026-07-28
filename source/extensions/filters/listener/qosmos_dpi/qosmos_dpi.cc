@@ -49,25 +49,58 @@ struct FiveTuple {
   bool is_v6{false};
 };
 
-// Build a VerdictCacheKey from the connection's destination address +
-// requested server name (populated by tls_inspector when present). Returns
-// a key with empty dst_ip iff there is no usable v4/v6 destination — the
-// caller should treat that as "skip cache lookup and populate" for this
-// connection.
-Extensions::Common::QosmosDpi::VerdictCacheKey
-computeCacheKey(const Network::ConnectionInfoProvider& info) {
-  Extensions::Common::QosmosDpi::VerdictCacheKey key;
+// Extract {dst-ip, dst-port} from the accepted socket. Returns an empty
+// .ip string on failure (no usable v4/v6 destination); callers should
+// skip the cache path in that case. Result matches the header's
+// Filter::DstAddrSnapshot shape so the two can be assigned directly.
+DstAddrSnapshot readDstAddr(const Network::ConnectionInfoProvider& info) {
   const auto& local = info.directLocalAddress();
-  if (local == nullptr || local->ip() == nullptr) return key;
-  key.dst_ip = local->ip()->addressAsString();
-  key.dst_port = local->ip()->port();
-  const absl::string_view sni = info.requestedServerName();
-  if (!sni.empty()) {
-    key.kind = Extensions::Common::QosmosDpi::DiscriminatorKind::Sni;
-    key.discriminator_value.assign(sni.data(), sni.size());
-  } else {
-    key.kind = Extensions::Common::QosmosDpi::DiscriminatorKind::Plain;
+  if (local == nullptr || local->ip() == nullptr) return {};
+  return {local->ip()->addressAsString(),
+          static_cast<uint16_t>(local->ip()->port())};
+}
+
+// Build a VerdictCacheKey from a destination + the discriminator hooks
+// extracted by the classifier on the first PDU. Priority hierarchy:
+//   1. ssl:server_name  (TLS SNI — primary)
+//   2. ssl:ja4          (TLS w/o SNI — fingerprint fallback)
+//   3. http:host        (cleartext HTTP Host / HTTP/2 :authority)
+//   4. Plain            (no name hint — {dst-ip, dst-port} alone)
+//
+// Verified attribute-name mapping matches qosmos-cache-poc's hook labels
+// (inspect_pcap4.sh + run_cache_poc.py). The classifier's extractor
+// (RealQosmosClassifier::extractDiscriminatorHooks) is responsible for
+// populating these into `hooks` if the corresponding Qosmos attribute
+// registered successfully at engine init.
+Extensions::Common::QosmosDpi::VerdictCacheKey
+computeCacheKeyFromHooks(const DstAddrSnapshot& dst,
+                          const Extensions::Common::QosmosDpi::Hooks& hooks) {
+  Extensions::Common::QosmosDpi::VerdictCacheKey key;
+  if (dst.ip.empty()) return key;
+  key.dst_ip = dst.ip;
+  key.dst_port = dst.port;
+  auto assign = [&](Extensions::Common::QosmosDpi::DiscriminatorKind kind,
+                    const std::string& value) {
+    key.kind = kind;
+    key.discriminator_value = value;
+  };
+  if (auto it = hooks.find("ssl:server_name");
+      it != hooks.end() && !it->second.empty()) {
+    assign(Extensions::Common::QosmosDpi::DiscriminatorKind::Sni, it->second);
+    return key;
   }
+  if (auto it = hooks.find("ssl:ja4");
+      it != hooks.end() && !it->second.empty()) {
+    assign(Extensions::Common::QosmosDpi::DiscriminatorKind::Ja4, it->second);
+    return key;
+  }
+  if (auto it = hooks.find("http:host");
+      it != hooks.end() && !it->second.empty()) {
+    assign(Extensions::Common::QosmosDpi::DiscriminatorKind::HttpHost,
+           it->second);
+    return key;
+  }
+  key.kind = Extensions::Common::QosmosDpi::DiscriminatorKind::Plain;
   return key;
 }
 
@@ -208,27 +241,16 @@ Network::FilterStatus Filter::onAccept(Network::ListenerFilterCallbacks& cb) {
 
   const auto& info = cb.socket().connectionInfoProvider();
 
-  // Verdict-cache lookup, when enabled. On hit: set the verdict directly
-  // from the cached entry and Continue without touching Qosmos. On miss:
-  // stash the key on the filter so onData/onSilenceTimeout can populate
-  // the cache and hand off the flow to the correction filter.
+  // Snapshot the destination for later cache-key building. No cache
+  // lookup yet — the key discriminator (SNI/JA4/Host) comes from
+  // classifyPdu hooks, which run in onData. See
+  // envoy-qosmos/docs/verdict-cache-onData-plan.md for rationale.
   //
-  // When disabled, cache_key_ stays empty and every branch below (which
-  // gates on !cache_key_.dst_ip.empty() && verdictCacheForThisThread())
-  // behaves exactly as today.
-  if (auto* cache = config_->verdictCacheForThisThread(); cache != nullptr) {
-    cache_key_ = computeCacheKey(info);
-    if (!cache_key_.dst_ip.empty()) {
-      auto hit = cache->lookup(cache_key_);
-      if (hit.has_value()) {
-        config_->stats().verdict_cache_hit_.inc();
-        const auto& cluster = hit->verdict_is_web ? config_->webCluster()
-                                                  : config_->nonWebCluster();
-        setVerdict(cluster, hit->verdict_is_web);
-        return Network::FilterStatus::Continue;
-      }
-      config_->stats().verdict_cache_miss_.inc();
-    }
+  // dst_addr_ stays empty when the socket has no usable v4/v6 local
+  // address (should never happen with original_dst upstream, but the
+  // rest of the filter treats an empty dst_ip as "skip cache path").
+  if (config_->verdictCacheForThisThread() != nullptr) {
+    dst_addr_ = readDstAddr(info);
   }
 
   const FiveTuple t = readFiveTuple(info);
@@ -281,14 +303,14 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
   config_->stats().bytes_processed_.recordValue(static_cast<uint64_t>(slice.len_));
 
   auto* cache = config_->verdictCacheForThisThread();
-  const bool correction_enabled = cache != nullptr && !cache_key_.dst_ip.empty();
+  const bool cache_available = cache != nullptr && !dst_addr_.ip.empty();
 
-  // When correction is enabled we call classifyPdu (no flow_destroy) so
-  // the correction network filter can keep feeding the same flow past the
-  // 4-packet boundary. Otherwise, preserve today's classifyFirstPdu shape
-  // (single-shot, immediate flow_destroy).
+  // When the cache is available we call classifyPdu (no flow_destroy) so
+  // the correction network filter — or this filter's own short-circuit
+  // branch below — controls the flow's fate. Otherwise, preserve today's
+  // classifyFirstPdu shape (single-shot, immediate flow_destroy).
   ClassifyResult cr;
-  if (correction_enabled) {
+  if (cache_available) {
     cr = classifier_->classifyPdu(
         slice.mem_, static_cast<int>(slice.len_), QMDPI_DIR_CTS,
         static_cast<int>(config_->defaultTenantId()));
@@ -310,9 +332,10 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
   }
 
   // Run the cascade: intermediate first, then final on inconclusive.
-  // The classifier extracts ssl:alpn from qmdpi_result for us so cascade
-  // rules 0 (non-web ALPN beats everything) and 1 (transport-token +
-  // HTTP ALPN ⇒ web) can fire.
+  // The classifier extracts ssl:alpn, ssl:server_name, ssl:ja4, http:host
+  // from qmdpi_result for us — see RealQosmosClassifier::extractDiscriminatorHooks.
+  // Cascade rules 0/1 consume alpn; the cache key builder below consumes
+  // the other three.
   std::optional<bool> verdict;
   const auto alpn_it = cr.hooks.find("ssl:alpn");
   const std::string alpn_str =
@@ -330,6 +353,51 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
               verdict.has_value() ? (*verdict ? "web" : "non-web") : "null");
   }
 
+  // Build the cache key now that we have hooks. This key is what the
+  // correction filter will later use to populate `final_seen=true`, and
+  // it's what we look up right now to see whether some earlier flow to
+  // the same discriminator has already been promoted to final.
+  if (cache_available) {
+    cache_key_ = computeCacheKeyFromHooks(dst_addr_, cr.hooks);
+  }
+
+  // ── Cache short-circuit: hit with final_seen=true ──
+  //
+  // A prior flow to the same {dst-ip, dst-port, SNI/JA4/Host} has already
+  // gone through correction and reached a terminal verdict. Use it,
+  // destroy the flow here, skip the hand-off to correction. If this
+  // flow's own initial cascade produced a different verdict, count it as
+  // a disagreement (per plan §7 option b — trust cache, log for
+  // observability, never override).
+  if (cache_available) {
+    if (auto hit = cache->lookup(cache_key_);
+        hit.has_value() && hit->final_seen) {
+      config_->stats().verdict_cache_hit_.inc();
+      if (verdict.has_value() && *verdict != hit->verdict_is_web) {
+        config_->stats().verdict_cache_disagreement_.inc();
+        ENVOY_LOG(debug, "qosmos_dpi: verdict_cache_disagreement "
+                          "(cached={} initial={} path='{}' alpn='{}')",
+                  hit->verdict_is_web ? "web" : "non-web",
+                  *verdict ? "web" : "non-web",
+                  cr.intermediate_path, alpn_str);
+      }
+      // Destroy the qmdpi_flow — no correction extension needed for this
+      // flow, we already have the terminal verdict.
+      classifier_->finalize();
+      const auto& cluster = hit->verdict_is_web ? config_->webCluster()
+                                                : config_->nonWebCluster();
+      setVerdict(cluster, hit->verdict_is_web);
+      return Network::FilterStatus::Continue;
+    }
+  }
+
+  // ── Fall-through: not a terminal hit ──
+  // Either the cache was disabled, no entry existed (miss), or the entry
+  // was still initial (final_seen=false — some other flow is currently
+  // running its correction extension for this key). All three cases route
+  // by our own initial verdict below and, when cache is available,
+  // populate/hand off so THIS flow contributes to (or races with) the
+  // correction observation.
   bool verdict_is_web = false;
   if (verdict.has_value() && *verdict) {
     verdict_is_web = true;
@@ -341,11 +409,22 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
     setVerdict(config_->nonWebCluster(), /*is_web=*/false);
   }
 
-  // Cache-populate + optional hand-off. Only when correction is enabled
+  // Cache-populate + optional hand-off. Only when the cache is available
   // AND we reached a real verdict (not the inconclusive default) — caching
   // "we had no signal, defaulted to non-web" would poison the cache and
   // suppress every future connection's DPI on that destination.
-  if (correction_enabled && verdict.has_value() && cb_ != nullptr) {
+  if (cache_available && verdict.has_value() && cb_ != nullptr) {
+    // Stat the outcome. A hit with final_seen=false is a "reinforcement"
+    // — folded into handed_off_to_correction so we keep one counter (per
+    // plan §Q2). The miss/hit distinction is bumped for observability but
+    // both paths hand off.
+    const auto pre_hit = cache->lookup(cache_key_);
+    if (pre_hit.has_value()) {
+      // Hit with final_seen=false (final_seen=true was handled above).
+      config_->stats().verdict_cache_hit_.inc();
+    } else {
+      config_->stats().verdict_cache_miss_.inc();
+    }
     if (!cache->put(cache_key_, verdict_is_web, "4pkt")) {
       config_->stats().verdict_cache_reject_full_.inc();
     }
@@ -354,7 +433,9 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
     if (cr.final_state) {
       // Rare: the engine already reached a final classification on this
       // very first PDU. Nothing to correct — finalize the flow here and
-      // don't burden the correction filter with a hand-off.
+      // don't burden the correction filter with a hand-off. Also promote
+      // the cache entry to final immediately.
+      cache->put(cache_key_, verdict_is_web, "final");
       classifier_->finalize();
     } else {
       // Park the live classifier in FilterState for the correction filter
@@ -388,8 +469,21 @@ void Filter::onSilenceTimeout() {
 
   const bool correction_enabled =
       config_->verdictCacheForThisThread() != nullptr &&
-      !cache_key_.dst_ip.empty() && classifier_ != nullptr &&
+      !dst_addr_.ip.empty() && classifier_ != nullptr &&
       classifier_->flowAlive() && cb_ != nullptr;
+
+  // On the silence-timeout path we have no hooks (classifyPdu never ran),
+  // so the cache key is Plain — {dst-ip, dst-port} alone. The correction
+  // filter, if it later reaches a real classification from STC bytes,
+  // populates the cache under this Plain key. Not perfect for shared
+  // {IP,port} destinations, but the alternative (skip the cache) would
+  // mean every future connection to the same IP:port re-arms silence
+  // and never gets the correction signal.
+  if (correction_enabled) {
+    cache_key_ =
+        computeCacheKeyFromHooks(dst_addr_,
+                                  Extensions::Common::QosmosDpi::Hooks{});
+  }
 
   // When correction is enabled, hand off the live-but-fed-nothing classifier
   // before setting the fallback verdict. The correction filter will see

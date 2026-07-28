@@ -35,6 +35,7 @@ TEST(VerdictCacheTest, PutThenLookupHits) {
   ASSERT_TRUE(hit.has_value());
   EXPECT_TRUE(hit->verdict_is_web);
   EXPECT_EQ(hit->source, "4pkt");
+  EXPECT_FALSE(hit->final_seen);   // "4pkt" ⇒ initial
   EXPECT_EQ(cache.size(), 1U);
 }
 
@@ -48,12 +49,61 @@ TEST(VerdictCacheTest, CorrectOverwritesEntry) {
   VerdictCache cache(10);
   const auto k = plainKey("1.2.3.4", 443);
   ASSERT_TRUE(cache.put(k, /*verdict_is_web=*/false, "4pkt"));
+  // Right after put with "4pkt", the entry is not yet final.
+  {
+    auto pre = cache.lookup(k);
+    ASSERT_TRUE(pre.has_value());
+    EXPECT_FALSE(pre->final_seen);
+  }
   ASSERT_TRUE(cache.correct(k, /*verdict_is_web=*/true));
   auto hit = cache.lookup(k);
   ASSERT_TRUE(hit.has_value());
   EXPECT_TRUE(hit->verdict_is_web);
   EXPECT_EQ(hit->source, "final");
-  EXPECT_EQ(cache.size(), 1U);   // corrected in-place, no growth.
+  EXPECT_TRUE(hit->final_seen);    // correct() promotes to terminal.
+  EXPECT_EQ(cache.size(), 1U);     // corrected in-place, no growth.
+}
+
+TEST(VerdictCacheTest, PostSilenceFinalIsAlsoFinalSeen) {
+  // The correction filter's silence-hand-off path writes source =
+  // "post_silence_final" when a silence-timeout flow eventually reached a
+  // real classification. Same terminal semantics as "final".
+  VerdictCache cache(10);
+  const auto k = plainKey("1.2.3.4", 25);
+  ASSERT_TRUE(cache.put(k, /*verdict_is_web=*/false, "post_silence_final"));
+  auto hit = cache.lookup(k);
+  ASSERT_TRUE(hit.has_value());
+  EXPECT_FALSE(hit->verdict_is_web);
+  EXPECT_EQ(hit->source, "post_silence_final");
+  EXPECT_TRUE(hit->final_seen);
+}
+
+TEST(VerdictCacheTest, PutFinalDirectlyBypassesInitialPhase) {
+  // Some paths (silence-hand-off with an already-known final verdict) write
+  // "final" without any prior "4pkt" put. Cache should reflect final_seen
+  // immediately.
+  VerdictCache cache(10);
+  const auto k = plainKey("5.6.7.8", 8080);
+  ASSERT_TRUE(cache.put(k, /*verdict_is_web=*/true, "final"));
+  auto hit = cache.lookup(k);
+  ASSERT_TRUE(hit.has_value());
+  EXPECT_TRUE(hit->final_seen);
+  EXPECT_EQ(hit->source, "final");
+}
+
+TEST(VerdictCacheTest, RewriteFromFinalBackToFourPktIsPermitted) {
+  // Defensive: nothing enforces monotonic promotion at the cache layer —
+  // it's a policy the callers keep. If a caller does put("4pkt") over an
+  // already-final entry, the entry demotes. Documents the layer contract.
+  VerdictCache cache(10);
+  const auto k = plainKey("5.6.7.8", 8080);
+  ASSERT_TRUE(cache.put(k, /*verdict_is_web=*/true, "final"));
+  ASSERT_TRUE(cache.put(k, /*verdict_is_web=*/false, "4pkt"));
+  auto hit = cache.lookup(k);
+  ASSERT_TRUE(hit.has_value());
+  EXPECT_FALSE(hit->final_seen);
+  EXPECT_EQ(hit->source, "4pkt");
+  EXPECT_FALSE(hit->verdict_is_web);
 }
 
 TEST(VerdictCacheTest, MaxEntriesCapRejectsNewKeyWhenFull) {

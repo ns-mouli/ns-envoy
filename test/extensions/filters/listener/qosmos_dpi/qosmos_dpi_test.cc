@@ -498,32 +498,108 @@ protected:
   std::unique_ptr<Filter> filter_;
 };
 
-TEST_F(QosmosDpiCacheFilterTest, OnAcceptCacheHitSkipsClassifierFactory) {
-  // Pre-populate the cache with a web verdict for 10.10.2.2:80.
-  ASSERT_TRUE(cache_->put(expectedKey(), /*verdict_is_web=*/true, "4pkt"));
-
-  filter_ = std::make_unique<Filter>(config_);
-  // Cache HIT branch returns Continue directly from onAccept.
-  EXPECT_EQ(filter_->onAccept(callbacks_),
-            Network::FilterStatus::Continue);
-  EXPECT_EQ(verdictCluster(), "web_cluster");
-  EXPECT_EQ(config_->stats().verdict_cache_hit_.value(), 1);
-  EXPECT_EQ(config_->stats().verdict_cache_miss_.value(), 0);
-  EXPECT_EQ(config_->stats().web_classified_.value(), 1);
-  // Classifier factory MUST NOT have been called on a hit.
-  EXPECT_EQ(factory_invoked_, 0);
-  EXPECT_EQ(captured_mock_, nullptr);
-}
-
-TEST_F(QosmosDpiCacheFilterTest, OnAcceptCacheMissRunsClassifier) {
-  next_result_.intermediate_path = "base.ip.tcp.http";
+TEST_F(QosmosDpiCacheFilterTest, OnAcceptAlwaysRunsClassifier) {
+  // Post-2026-07-28 semantics: cache lookup is deferred to onData (until
+  // classifyPdu emits the discriminator hooks). onAccept always creates a
+  // classifier and arms the silence timer — the cache never short-circuits
+  // at accept time.
+  ASSERT_TRUE(cache_->put(expectedKey(), /*verdict_is_web=*/true, "final"));
 
   filter_ = std::make_unique<Filter>(config_);
   EXPECT_EQ(filter_->onAccept(callbacks_),
             Network::FilterStatus::StopIteration);
+  // No cache stats bumped at accept time — that's all onData's job now.
+  EXPECT_EQ(config_->stats().verdict_cache_hit_.value(), 0);
+  EXPECT_EQ(config_->stats().verdict_cache_miss_.value(), 0);
+  EXPECT_EQ(config_->stats().web_classified_.value(), 0);
+  EXPECT_EQ(factory_invoked_, 1);
+  EXPECT_NE(captured_mock_, nullptr);
+}
+
+TEST_F(QosmosDpiCacheFilterTest, OnDataCacheHitFinalSeenShortCircuitsHandoff) {
+  // Pre-populate the cache with a terminal (final_seen=true) entry for
+  // {10.10.2.2, 80, Plain}. First PDU arrives, classifier runs, key is
+  // built from hooks (no SNI/Host in this fixture → Plain), lookup hits
+  // final. Verdict served from cache; classifier finalized; no hand-off.
+  ASSERT_TRUE(cache_->put(expectedKey(), /*verdict_is_web=*/true, "final"));
+  next_result_.intermediate_path = "base.ip.tcp.http";
+
+  filter_ = std::make_unique<Filter>(config_);
+  ASSERT_EQ(filter_->onAccept(callbacks_),
+            Network::FilterStatus::StopIteration);
+  FakeListenerFilterBuffer fb("GET / HTTP/1.1\r\n\r\n");
+  ASSERT_EQ(filter_->onData(fb), Network::FilterStatus::Continue);
+
+  EXPECT_EQ(verdictCluster(), "web_cluster");
+  EXPECT_EQ(config_->stats().verdict_cache_hit_.value(), 1);
+  EXPECT_EQ(config_->stats().verdict_cache_miss_.value(), 0);
+  EXPECT_EQ(config_->stats().web_classified_.value(), 1);
+  // No hand-off — the terminal cache entry short-circuited the flow.
+  EXPECT_EQ(config_->stats().handed_off_to_correction_.value(), 0);
+  EXPECT_EQ(getHandoff(), nullptr);
+  ASSERT_NE(captured_mock_, nullptr);
+  EXPECT_FALSE(captured_mock_->flow_alive_);   // finalize() ran.
+}
+
+TEST_F(QosmosDpiCacheFilterTest, OnDataCacheDisagreementCountedNotOverridden) {
+  // Cached final verdict is web, but the current flow's initial cascade
+  // resolves to non-web. Trust the cache (§3 option b), bump the
+  // disagreement stat, don't override.
+  ASSERT_TRUE(cache_->put(expectedKey(), /*verdict_is_web=*/true, "final"));
+  next_result_.intermediate_path = "base.ip.tcp.ftp";   // Rule 2 → non-web.
+
+  filter_ = std::make_unique<Filter>(config_);
+  ASSERT_EQ(filter_->onAccept(callbacks_),
+            Network::FilterStatus::StopIteration);
+  FakeListenerFilterBuffer fb("USER anonymous\r\n");
+  ASSERT_EQ(filter_->onData(fb), Network::FilterStatus::Continue);
+
+  EXPECT_EQ(verdictCluster(), "web_cluster");   // cache wins.
+  EXPECT_EQ(config_->stats().verdict_cache_disagreement_.value(), 1);
+  EXPECT_EQ(config_->stats().verdict_cache_hit_.value(), 1);
+  EXPECT_EQ(config_->stats().web_classified_.value(), 1);
+  EXPECT_EQ(config_->stats().handed_off_to_correction_.value(), 0);
+}
+
+TEST_F(QosmosDpiCacheFilterTest, OnDataCacheHitInitialOnlyHandsOff) {
+  // Cache has an entry, but final_seen=false — another flow is still on
+  // its correction extension. Current flow "reinforces" by running its
+  // own classify + hand-off (folded into handed_off_to_correction stat).
+  ASSERT_TRUE(cache_->put(expectedKey(), /*verdict_is_web=*/true, "4pkt"));
+  next_result_.intermediate_path = "base.ip.tcp.http";
+
+  filter_ = std::make_unique<Filter>(config_);
+  ASSERT_EQ(filter_->onAccept(callbacks_),
+            Network::FilterStatus::StopIteration);
+  FakeListenerFilterBuffer fb("GET / HTTP/1.1\r\n\r\n");
+  ASSERT_EQ(filter_->onData(fb), Network::FilterStatus::Continue);
+
+  EXPECT_EQ(verdictCluster(), "web_cluster");
+  // hit stat bumped, but hand-off ALSO happened (reinforcement).
+  EXPECT_EQ(config_->stats().verdict_cache_hit_.value(), 1);
+  EXPECT_EQ(config_->stats().verdict_cache_miss_.value(), 0);
+  EXPECT_EQ(config_->stats().handed_off_to_correction_.value(), 1);
+  EXPECT_NE(getHandoff(), nullptr);
+}
+
+TEST_F(QosmosDpiCacheFilterTest, OnDataCacheMissPopulatesAndHandsOff) {
+  // Classic miss path: fresh key, classifyPdu emits an initial verdict,
+  // cache populated with source="4pkt", hand-off parked in FilterState.
+  next_result_.intermediate_path = "base.ip.tcp.http";
+
+  filter_ = std::make_unique<Filter>(config_);
+  ASSERT_EQ(filter_->onAccept(callbacks_),
+            Network::FilterStatus::StopIteration);
+  FakeListenerFilterBuffer fb("GET / HTTP/1.1\r\n\r\n");
+  ASSERT_EQ(filter_->onData(fb), Network::FilterStatus::Continue);
+
   EXPECT_EQ(config_->stats().verdict_cache_miss_.value(), 1);
   EXPECT_EQ(config_->stats().verdict_cache_hit_.value(), 0);
-  EXPECT_EQ(factory_invoked_, 1);
+  EXPECT_EQ(config_->stats().handed_off_to_correction_.value(), 1);
+  auto hit = cache_->lookup(expectedKey());
+  ASSERT_TRUE(hit.has_value());
+  EXPECT_FALSE(hit->final_seen);
+  EXPECT_EQ(hit->source, "4pkt");
 }
 
 TEST_F(QosmosDpiCacheFilterTest, OnDataPopulatesCacheAndHandsOff) {
