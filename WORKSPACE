@@ -100,3 +100,26 @@ cc_library(
 )
 """,
 )
+
+# System libpcap headers for the corpus-replay direct-inject test only.
+# Not used by envoy-static; the corpus replay pcap reader
+# (test/extensions/common/qosmos_dpi/pcap_reader.cc) needs pcap.h. Ubuntu
+# 20.04's libpcap-dev installs headers under /usr/include; the .so is
+# resolved at link time from /lib/x86_64-linux-gnu/libpcap.so via -lpcap.
+new_local_repository(
+    name = "system_libpcap",
+    path = "/usr/include",
+    build_file_content = """
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "pcap",
+    hdrs = glob([
+        "pcap.h",
+        "pcap/*.h",
+    ]),
+    includes = ["."],
+    linkopts = ["-lpcap"],
+)
+""",
+)

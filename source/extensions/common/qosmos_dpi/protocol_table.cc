@@ -156,6 +156,14 @@ bool alpnMatchesNonWeb(absl::string_view value, absl::string_view prefix) {
 
 std::optional<bool> ProtocolTable::isWeb(absl::string_view path,
                                          const Hooks& hooks) const {
+  Rule ignored = Rule::kNone;
+  return isWebWithRule(path, hooks, ignored);
+}
+
+std::optional<bool> ProtocolTable::isWebWithRule(absl::string_view path,
+                                                  const Hooks& hooks,
+                                                  Rule& rule_out) const {
+  rule_out = Rule::kNone;
   // The cascade is undecidable when we have no path at all; the caller
   // defaults to non-web (CFW) per phase-1 fail-safe.
   if (path.empty()) return std::nullopt;
@@ -170,6 +178,7 @@ std::optional<bool> ProtocolTable::isWeb(absl::string_view path,
   for (const auto& v : alpn_values) {
     for (const auto& p : non_web_alpn_prefixes_) {
       if (alpnMatchesNonWeb(v, p)) {
+        rule_out = Rule::kRule0NonWebAlpn;
         return false;  // non-web
       }
     }
@@ -187,6 +196,7 @@ std::optional<bool> ProtocolTable::isWeb(absl::string_view path,
     for (const auto& v : alpn_values) {
       for (const auto& p : http_alpn_prefixes_) {
         if (absl::StartsWith(v, p)) {
+          rule_out = Rule::kRule1TransportHostingAlpn;
           return true;  // web
         }
       }
@@ -200,6 +210,7 @@ std::optional<bool> ProtocolTable::isWeb(absl::string_view path,
   // is the safer error asymmetry.
   if (!last_is_hosting) {
     if (auto it = web_apps_.find(last); it != web_apps_.end()) {
+      rule_out = Rule::kRule2CsvLookup;
       return it->second;  // CSV-authoritative web/non-web
     }
   }
@@ -211,11 +222,13 @@ std::optional<bool> ProtocolTable::isWeb(absl::string_view path,
   const std::string lowered = toLower(path);
   for (const auto& token : web_substring_tokens_) {
     if (absl::StrContains(lowered, token)) {
+      rule_out = Rule::kRule3SubstringFallback;
       return true;  // web
     }
   }
 
   // ── Rule 4: Default ──
+  rule_out = Rule::kRule4DefaultNonWeb;
   return false;  // non-web
 }
 
