@@ -47,6 +47,24 @@ public:
   // non-web (CFW) per the phase-1 fail-safe.
   std::optional<bool> isWeb(absl::string_view path, const Hooks& hooks) const;
 
+  // 5-rule cascade identifiers (matches qosmos-poc/scripts/run_tests.py).
+  // Used by the corpus-replay harness to report rule-hit distribution.
+  enum class Rule {
+    kNone = -1,                   // path empty → nullopt (no rule ran)
+    kRule0NonWebAlpn = 0,
+    kRule1TransportHostingAlpn,
+    kRule2CsvLookup,
+    kRule3SubstringFallback,
+    kRule4DefaultNonWeb,
+  };
+
+  // Same cascade as isWeb() but also reports which rule tier decided the
+  // verdict. Byte-behaviour of the returned verdict matches isWeb() exactly
+  // (isWeb() delegates to this internally). Off the hot path — only the
+  // corpus-replay gtest calls it.
+  std::optional<bool> isWebWithRule(absl::string_view path, const Hooks& hooks,
+                                     Rule& rule_out) const;
+
   // Diagnostic hooks for unit tests.
   size_t numProtocols() const { return web_apps_.size(); }
   const std::string& version() const { return version_; }
