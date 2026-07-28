@@ -209,13 +209,21 @@ private:
   // per-worker cacheForThisThread() calls flow through this same slot.
   ThreadLocal::TypedSlotPtr<VerdictCache> cache_slot_;
 
-  // Cascade rules 0/1 consume `ssl:alpn`. We register that attribute at
-  // init time and cache its (proto_id, attr_id) integer pair so the
-  // per-classify result-iteration can match it without string lookups.
-  // Negative values ⇒ registration failed (cascade will run without ALPN
-  // hooks; rules 0/1 won't fire; behaviour is conservative).
+  // Attribute IDs cached at engine init so the per-classify hook extractor
+  // can match them without string lookups. Negative values ⇒ registration
+  // failed (that hook will simply not be emitted; downstream code degrades
+  // gracefully — cascade rules 0/1 skip if alpn is missing; the cache key
+  // falls back to a coarser discriminator if a name hint is missing).
+  //
+  // Discriminator hierarchy consumed by the listener filter's post-
+  // classifyPdu cache-key builder: ssl:server_name > ssl:ja4 > http:host >
+  // Plain. All four attributes are registered here.
   int ssl_proto_id_{-1};
   int alpn_attr_id_{-1};
+  int sni_attr_id_{-1};
+  int ja4_attr_id_{-1};
+  int http_proto_id_{-1};
+  int host_attr_id_{-1};
 };
 
 using QosmosEngineSharedPtr = std::shared_ptr<QosmosEngine>;

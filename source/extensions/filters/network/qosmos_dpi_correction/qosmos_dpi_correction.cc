@@ -230,9 +230,14 @@ void Filter::finalizeAndMaybeCorrect(bool final_state_reached) {
                 "qosmos_dpi_correction: verdict flip {} -> {} (path='{}')",
                 *initial_verdict_is_web_ ? "web" : "non-web",
                 new_is_web ? "web" : "non-web", path);
+    } else {
+      // Agree: still PROMOTE the entry from initial (source="4pkt",
+      // final_seen=false) to terminal (source="final", final_seen=true).
+      // Without this promotion, subsequent flows would keep reinforcement-
+      // handing-off through correction for a destination we've already
+      // pinned, defeating the cache's whole point.
+      cache.correct(key_, new_is_web);
     }
-    // No-op if the verdict agrees: the "4pkt" entry the listener filter
-    // put is already correct.
   } else {
     // Silence-timeout hand-off. First-time populate. Distinct stat from
     // correction_flips_ because there was no prior verdict to disagree

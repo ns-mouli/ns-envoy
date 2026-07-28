@@ -85,6 +85,7 @@ using ClassifierFactory =
   COUNTER(verdict_cache_hit)                                                  \
   COUNTER(verdict_cache_miss)                                                 \
   COUNTER(verdict_cache_reject_full)                                          \
+  COUNTER(verdict_cache_disagreement)                                         \
   COUNTER(handed_off_to_correction)                                           \
   GAUGE(flows_active, NeverImport)                                            \
   GAUGE(verdict_cache_size, NeverImport)                                      \
@@ -93,6 +94,16 @@ using ClassifierFactory =
 struct QosmosDpiStats {
   ALL_QOSMOS_DPI_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT,
                        GENERATE_HISTOGRAM_STRUCT)
+};
+
+// Snapshot of the accepted connection's destination — captured in onAccept
+// so onData / onSilenceTimeout can compose the verdict cache key (adding
+// a hooks-derived SNI/JA4/Host discriminator, or Plain when no name hint
+// is available). An empty `.ip` signals "no cache key computable"; the
+// filter treats that as fail-safe and skips the cache path.
+struct DstAddrSnapshot {
+  std::string ip;
+  uint16_t port{0};
 };
 
 // Config for the qosmos_dpi listener filter. One Config per listener; the
@@ -228,11 +239,18 @@ private:
   bool classify_invoked_{false};   // true once classifyFirstPdu has run.
   bool handed_off_{false};         // true once classifier_ was moved into
                                     // a QosmosFlowHandoff in FilterState.
-  // Only populated when verdictCacheCorrectionEnabled(). Computed in
-  // onAccept from the connection's 5-tuple + SNI (if tls_inspector ran).
-  // Empty dst_ip signals "no key computed" (either the cache is off or
-  // the socket had no v4/v6 destination info yet — fail-safe: do not
-  // cache-lookup / cache-populate for this connection).
+  // Only populated when verdictCacheCorrectionEnabled(). Cached from
+  // onAccept and consumed in onData / onSilenceTimeout: destination
+  // {ip, port} — the discriminator part of the key comes from post-
+  // classifyPdu hooks (SNI/JA4/Host) and is folded in there. Empty
+  // dst_addr_.ip signals "no key computed" (fail-safe: skip cache
+  // lookup / populate for this connection). DstAddrSnapshot type
+  // declared at namespace scope below the class.
+  DstAddrSnapshot dst_addr_;
+  // Full cache key: dst_addr_ + hooks-derived discriminator. Populated in
+  // onData right after classifyPdu (so it can be handed to the correction
+  // filter via QosmosFlowHandoff), or in onSilenceTimeout using
+  // dst_addr_ + Plain discriminator (no hooks available yet).
   Extensions::Common::QosmosDpi::VerdictCacheKey cache_key_;
   size_t bytes_peeked_this_pdu_{0};   // set in onData right before
                                        // classifyPdu; consumed when a
