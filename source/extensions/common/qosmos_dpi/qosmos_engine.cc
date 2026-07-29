@@ -529,6 +529,24 @@ public:
     return result;
   }
 
+  // qmdpi_worker_process_fqdn: derive a classification path from an FQDN (the
+  // SNI) alone — no flow interaction. qmdpi_path is a fixed-size struct
+  // (qmdpi_struct.h: {uint32_t qp_len; uint32_t qp_value[16]}), so we can
+  // stack-allocate it. Returns the rendered path or "" on error/empty.
+  std::string classifyFqdn(const std::string& fqdn) override {
+    if (worker_ == nullptr || bundle_ == nullptr || fqdn.empty()) {
+      return {};
+    }
+    qmdpi_path path;
+    std::memset(&path, 0, sizeof(path));
+    int rc = qmdpi_worker_process_fqdn(worker_, bundle_, fqdn.c_str(), &path);
+    if (rc < 0) {
+      ENVOY_LOG(debug, "qosmos_dpi: qmdpi_worker_process_fqdn('{}') rc={}", fqdn, rc);
+      return {};
+    }
+    return pathToString(bundle_, &path);
+  }
+
 private:
   // Walk qmdpi_result_attr_getnext ONCE and pluck out every registered
   // discriminator hook into `hooks`. Keys:

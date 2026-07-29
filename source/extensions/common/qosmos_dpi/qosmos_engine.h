@@ -79,6 +79,18 @@ public:
   // calls are no-ops returning ClassifyResult{engine_error=true}.
   virtual ClassifyResult finalize() PURE;
 
+  // Standalone FQDN classification via qmdpi_worker_process_fqdn: resolve a
+  // classification path from a domain name (e.g. the TLS SNI extracted on the
+  // ClientHello) WITHOUT feeding a PDU or destroying the flow. Returns the
+  // rendered path (empty on error / no SNI / unsupported). Lets a caller get an
+  // app-resolved verdict from the SNI on the first packet while keeping the
+  // live flow alive for the correction hand-off. Default no-op so mocks and
+  // other implementations are unaffected.
+  virtual std::string classifyFqdn(const std::string& fqdn) {
+    (void)fqdn;
+    return {};
+  }
+
   // Convenience wrapper: classifyPdu + finalize, merged. This is the
   // pre-cache single-shot path — the listener filter uses it when
   // verdict_cache_correction_enabled is false (default), preserving today's

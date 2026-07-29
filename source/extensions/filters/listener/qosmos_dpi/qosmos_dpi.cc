@@ -337,20 +337,72 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
   // Cascade rules 0/1 consume alpn; the cache key builder below consumes
   // the other three.
   std::optional<bool> verdict;
+  ProtocolTable::Rule initial_rule = ProtocolTable::Rule::kNone;
   const auto alpn_it = cr.hooks.find("ssl:alpn");
   const std::string alpn_str =
       alpn_it != cr.hooks.end() ? alpn_it->second : std::string{};
   if (!cr.intermediate_path.empty()) {
-    verdict = config_->table().isWeb(cr.intermediate_path, cr.hooks);
+    verdict = config_->table().isWebWithRule(cr.intermediate_path, cr.hooks, initial_rule);
     ENVOY_LOG(debug, "qosmos_dpi: intermediate path='{}' alpn='{}' verdict={}",
               cr.intermediate_path, alpn_str,
               verdict.has_value() ? (*verdict ? "web" : "non-web") : "null");
   }
   if (!verdict.has_value() && !cr.final_path.empty()) {
-    verdict = config_->table().isWeb(cr.final_path, cr.hooks);
+    verdict = config_->table().isWebWithRule(cr.final_path, cr.hooks, initial_rule);
     ENVOY_LOG(debug, "qosmos_dpi: final-after-destroy path='{}' alpn='{}' verdict={}",
               cr.final_path, alpn_str,
               verdict.has_value() ? (*verdict ? "web" : "non-web") : "null");
+  }
+
+  // ── FQDN-first refinement (SNI for TLS, Host for cleartext HTTP) ──
+  //
+  // On the first PDU Qosmos often hasn't committed the app into the path yet:
+  // a TLS ClientHello yields the coarse provisional `base.ip.tcp.ssl` scored on
+  // ALPN alone (rule 0/1 → web-biased), and cleartext HTTP can yield a generic
+  // `base.ip.tcp.http`. But the discriminator the engine DID extract as a hook
+  // — SNI (`ssl:server_name`) for TLS, Host (`http:host`) for HTTP — already
+  // names the destination. Resolve the app from it via qmdpi_worker_process_fqdn
+  // (a standalone domain classification that feeds no PDU and does NOT destroy
+  // the flow) and route on that more-resolved verdict, while still handing the
+  // live flow to correction below for bidirectional confirmation.
+  //
+  // Applied only when the cascade did NOT already pin an app (rule !=
+  // kRule2CsvLookup): an app-pinned intermediate path is at least as specific
+  // as the domain, so overriding it could only lose information. This keeps the
+  // refinement strictly accuracy-improving (see docs/real-envoy-corpus-vs-poc.md
+  // §"Remediation validated": 100% of resolvable-SNI flips resolve to the
+  // corrected verdict from the discriminator alone). No config gate — the rule
+  // guard already scopes it to the coarse-verdict case. `final_state` cases and
+  // flows with no SNI/Host (ECH, old ClientHellos) fall back to the cascade.
+  if (!cr.final_state && classifier_ != nullptr &&
+      initial_rule != ProtocolTable::Rule::kRule2CsvLookup) {
+    absl::string_view fqdn_src;
+    std::string fqdn;
+    if (const auto it = cr.hooks.find("ssl:server_name");
+        it != cr.hooks.end() && !it->second.empty()) {
+      fqdn = it->second;
+      fqdn_src = "sni";
+    } else if (const auto it2 = cr.hooks.find("http:host");
+               it2 != cr.hooks.end() && !it2->second.empty()) {
+      fqdn = it2->second;
+      fqdn_src = "host";
+    }
+    if (!fqdn.empty()) {
+      const std::string fqdn_path = classifier_->classifyFqdn(fqdn);
+      if (!fqdn_path.empty()) {
+        ProtocolTable::Rule fqdn_rule = ProtocolTable::Rule::kNone;
+        if (auto fqdn_verdict =
+                config_->table().isWebWithRule(fqdn_path, cr.hooks, fqdn_rule);
+            fqdn_verdict.has_value()) {
+          ENVOY_LOG(debug, "qosmos_dpi: fqdn-refine src={} fqdn='{}' path='{}' "
+                            "verdict={} (was intermediate verdict={})",
+                    fqdn_src, fqdn, fqdn_path,
+                    *fqdn_verdict ? "web" : "non-web",
+                    verdict.has_value() ? (*verdict ? "web" : "non-web") : "null");
+          verdict = fqdn_verdict;
+        }
+      }
+    }
   }
 
   // Build the cache key now that we have hooks. This key is what the

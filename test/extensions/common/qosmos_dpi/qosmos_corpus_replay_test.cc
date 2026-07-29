@@ -555,6 +555,102 @@ TEST_F(QosmosCorpusReplayTest, ReplayCorpus) {
   }
 }
 
+// Experiment: would classifying the SNI alone (qmdpi_worker_process_fqdn) on
+// the first packet give the CORRECTED verdict — i.e. fix the ALPN-driven
+// web-bias without destroying the flow? Reads a TSV from $QOSMOS_FQDN_INPUT:
+//   name<TAB>sni<TAB>corrected_verdict     (corrected in {web, non-web})
+// For each, resolves the FQDN path, scores it through the same cascade, and
+// compares to `corrected`. Writes results to $QOSMOS_FQDN_OUT (default
+// <results_dir>/fqdn_probe.tsv). GTEST_SKIP if no input provided.
+TEST_F(QosmosCorpusReplayTest, FqdnProbe) {
+  const Config cfg = loadConfig();
+  const std::string input = envOr("QOSMOS_FQDN_INPUT", "");
+  if (input.empty() || !fs::exists(input)) {
+    GTEST_SKIP() << "set QOSMOS_FQDN_INPUT to a TSV (name<TAB>sni<TAB>corrected)";
+  }
+  if (!fs::exists(cfg.protocol_table_path)) {
+    GTEST_SKIP() << "protocol table not found: " << cfg.protocol_table_path;
+  }
+  fs::create_directories(cfg.results_dir);
+
+  auto engine = std::make_shared<QosmosEngine>(
+      /*engine_config=*/"", /*bundle_path=*/"", cfg.protocol_table_path,
+      /*nb_workers=*/1, tls_, /*verdict_cache_max_entries=*/0,
+      /*total_nb_flows=*/0);
+  const ProtocolTable& table = engine->table();
+  std::cerr << "[fqdn-probe] table version: " << table.version() << std::endl;
+
+  // One worker-backed classifier (dummy 5-tuple); classifyFqdn ignores the flow.
+  const uint8_t sip[4] = {10, 0, 0, 2};
+  const uint8_t dip[4] = {1, 1, 1, 1};
+  auto classifier = engine->makeClassifier(/*is_v6=*/false, sip, htons(12345),
+                                            dip, htons(443));
+  ASSERT_TRUE(classifier != nullptr);
+
+  const std::string out_path =
+      envOr("QOSMOS_FQDN_OUT", cfg.results_dir + "/fqdn_probe.tsv");
+  std::ofstream out(out_path);
+  out << "name\tsni\tfqdn_path\tfqdn_verdict\tcorrected\tmatch\n";
+
+  std::ifstream in(input);
+  std::string line;
+  size_t total = 0, resolved = 0, matched = 0, empty_sni = 0;
+  while (std::getline(in, line)) {
+    if (line.empty() || line[0] == '#') {
+      continue;
+    }
+    const size_t t1 = line.find('\t');
+    const size_t t2 = (t1 == std::string::npos) ? std::string::npos
+                                                 : line.find('\t', t1 + 1);
+    if (t1 == std::string::npos || t2 == std::string::npos) {
+      continue;
+    }
+    const std::string name = line.substr(0, t1);
+    const std::string sni = line.substr(t1 + 1, t2 - t1 - 1);
+    std::string corrected = line.substr(t2 + 1);
+    const size_t t3 = corrected.find('\t');  // ignore any trailing columns
+    if (t3 != std::string::npos) {
+      corrected = corrected.substr(0, t3);
+    }
+    ++total;
+    if (sni.empty() || sni == "-") {
+      ++empty_sni;
+      out << name << "\t" << sni << "\t\t(no-sni)\t" << corrected << "\tNA\n";
+      continue;
+    }
+    const std::string path = classifier->classifyFqdn(sni);
+    ProtocolTable::Rule rule = ProtocolTable::Rule::kNone;
+    const std::string verdict =
+        path.empty() ? "unresolved"
+                     : verdictLabel(table.isWebWithRule(path, Hooks{}, rule));
+    if (!path.empty()) {
+      ++resolved;
+    }
+    // verdictLabel() renders "non_web"; callers may pass "non-web" — compare
+    // canonically so the hyphen/underscore spelling doesn't matter.
+    auto canon = [](std::string v) {
+      std::replace(v.begin(), v.end(), '-', '_');
+      return v;
+    };
+    const bool match = (canon(verdict) == canon(corrected));
+    if (match) {
+      ++matched;
+    }
+    out << name << "\t" << sni << "\t" << path << "\t" << verdict << "\t"
+        << corrected << "\t" << (match ? "YES" : "no") << "\n";
+  }
+  out.close();
+
+  std::cerr << "[fqdn-probe] cases=" << total << " with_sni=" << (total - empty_sni)
+            << " fqdn_resolved_path=" << resolved
+            << " fqdn_verdict==corrected=" << matched << " -> "
+            << (total ? 100.0 * matched / total : 0.0) << "% of all, "
+            << ((total - empty_sni) ? 100.0 * matched / (total - empty_sni) : 0.0)
+            << "% of with-sni" << std::endl;
+  std::cerr << "[fqdn-probe] wrote " << out_path << std::endl;
+  EXPECT_GT(total, 0u);
+}
+
 }  // namespace
 }  // namespace QosmosDpi
 }  // namespace Common
