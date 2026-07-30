@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 
 #include "envoy/network/address.h"
 
@@ -36,9 +37,27 @@ QosmosDpiStats generateStats(Stats::Scope& scope) {
 }
 
 // Read the 5-tuple from the accepted socket. remoteAddress() = client (CTS src),
-// directLocalAddress() = original destination (CTS dst, populated by the
-// kernel via SO_ORIGINAL_DST when iptables REDIRECT/TPROXY is in front of
-// envoy — see Topology A/B docs).
+// localAddress() = original destination (CTS dst).
+//
+// MUST be localAddress(), NOT directLocalAddress(). Envoy's contract
+// (envoy/network/socket.h:225) is that directLocalAddress() is "the listener
+// address and it can not be modified by listener filters" — original_dst
+// restores the SO_ORIGINAL_DST destination via restoreLocalAddress(), which
+// writes local_address_ and deliberately leaves direct_local_address_ alone
+// (source/common/network/socket_impl.h:44-47).
+//
+// Under TPROXY/IP_TRANSPARENT the socket is bound to the original destination,
+// so the two agree and the distinction is invisible. Under iptables REDIRECT
+// they do NOT: directLocalAddress() is the listener's own ip:port for every
+// connection, which silently (a) collapsed the verdict-cache key to its
+// discriminator alone and (b) fed Qosmos a constant flow signature, disabling
+// its IP-classification and internal-cache mechanisms. See design.md §13.15.
+//
+// ORDERING REQUIREMENT: qosmos_dpi must be listed AFTER original_dst in
+// listener_filters, so original_dst's onAccept has already restored the
+// address by the time ours runs. topology-c-qosmos.yaml orders it correctly.
+// If original_dst is absent, localAddress() == directLocalAddress() and this
+// degrades to the previous behaviour rather than breaking.
 struct FiveTuple {
   in_addr  v4_src{};
   in_addr  v4_dst{};
@@ -54,7 +73,7 @@ struct FiveTuple {
 // skip the cache path in that case. Result matches the header's
 // Filter::DstAddrSnapshot shape so the two can be assigned directly.
 DstAddrSnapshot readDstAddr(const Network::ConnectionInfoProvider& info) {
-  const auto& local = info.directLocalAddress();
+  const auto& local = info.localAddress();   // NOT directLocalAddress() — see above
   if (local == nullptr || local->ip() == nullptr) return {};
   return {local->ip()->addressAsString(),
           static_cast<uint16_t>(local->ip()->port())};
@@ -107,26 +126,35 @@ computeCacheKeyFromHooks(const DstAddrSnapshot& dst,
 FiveTuple readFiveTuple(const Network::ConnectionInfoProvider& info) {
   FiveTuple t{};
   const auto& remote = info.remoteAddress();
-  const auto& local = info.directLocalAddress();
+  const auto& local = info.localAddress();   // NOT directLocalAddress() — see above
   if (remote != nullptr && remote->ip() != nullptr && remote->ip()->ipv4() != nullptr &&
       local != nullptr && local->ip() != nullptr && local->ip()->ipv4() != nullptr) {
-    t.v4_src.s_addr = htonl(remote->ip()->ipv4()->address());
-    t.v4_dst.s_addr = htonl(local->ip()->ipv4()->address());
+    // NO htonl(): Ipv4::address() is documented (envoy/network/address.h:38)
+    // as already being "the 32-bit IPv4 address in network byte order", and
+    // the impl returns sockaddr_in::sin_addr.s_addr verbatim
+    // (address_impl.h:180). Byte-swapping it here reversed every address we
+    // handed Qosmos — 10.10.2.2 arrived as 2.2.10.10. Ports DO need htons:
+    // Ip::port() returns host byte order. See design.md §13.15.
+    t.v4_src.s_addr = remote->ip()->ipv4()->address();
+    t.v4_dst.s_addr = local->ip()->ipv4()->address();
     t.src_port_nbo = htons(remote->ip()->port());
     t.dst_port_nbo = htons(local->ip()->port());
     return t;
   }
   t.is_v6 = true;
+  // Same correction for v6. Ipv6Helper::address() memcpy's the 16 network-order
+  // bytes of sin6_addr straight into the uint128 (address_impl.cc:239-244), so
+  // its memory already holds them in wire order. The previous loop wrote byte i
+  // to position 15-i, reversing them.
   if (remote != nullptr && remote->ip() != nullptr && remote->ip()->ipv6() != nullptr) {
-    auto a = remote->ip()->ipv6()->address();
-    auto* dst = reinterpret_cast<uint8_t*>(&t.v6_src);
-    for (int i = 0; i < 16; ++i) dst[15 - i] = static_cast<uint8_t>(a >> (i * 8));
+    const absl::uint128 a = remote->ip()->ipv6()->address();
+    static_assert(sizeof(a) == sizeof(t.v6_src), "uint128 must be 16 bytes");
+    std::memcpy(&t.v6_src, &a, sizeof(t.v6_src));
     t.src_port_nbo = htons(remote->ip()->port());
   }
   if (local != nullptr && local->ip() != nullptr && local->ip()->ipv6() != nullptr) {
-    auto a = local->ip()->ipv6()->address();
-    auto* dst = reinterpret_cast<uint8_t*>(&t.v6_dst);
-    for (int i = 0; i < 16; ++i) dst[15 - i] = static_cast<uint8_t>(a >> (i * 8));
+    const absl::uint128 a = local->ip()->ipv6()->address();
+    std::memcpy(&t.v6_dst, &a, sizeof(t.v6_dst));
     t.dst_port_nbo = htons(local->ip()->port());
   }
   return t;

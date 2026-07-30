@@ -1,3 +1,5 @@
+#include <arpa/inet.h>
+
 #include <fstream>
 #include <memory>
 #include <string>
@@ -158,16 +160,34 @@ protected:
     ASSERT_TRUE(remote_or.ok());
     ASSERT_TRUE(local_or.ok());
     callbacks_.socket_.connection_info_provider_->setRemoteAddress(*remote_or);
+    // localAddress = real destination (restored by original_dst, which is
+    // ordered before us); directLocalAddress = the listener's own ip:port,
+    // as under iptables REDIRECT. They MUST differ so the fixture can tell
+    // the two accessors apart — see §13.15 / readFiveTuple.
     callbacks_.socket_.connection_info_provider_->setLocalAddress(*local_or);
+    auto listener_or = Network::Utility::resolveUrl("tcp://10.10.0.1:8443");
+    ASSERT_TRUE(listener_or.ok());
+    callbacks_.socket_.connection_info_provider_->setDirectLocalAddressForTest(
+        *listener_or);
 
     // Filter calls dispatcher() to arm the silence timer; return our mock.
     ON_CALL(callbacks_, dispatcher()).WillByDefault(ReturnRef(dispatcher_));
 
     // Build the classifier factory that captures whatever knobs the test
     // set on next_factory_*.
-    auto factory = [this](bool /*is_v6*/, const void* /*src_ip*/,
-                           uint16_t /*src_port*/, const void* /*dst_ip*/,
-                           uint16_t /*dst_port*/) -> QosmosClassifierPtr {
+    auto factory = [this](bool is_v6, const void* /*src_ip*/,
+                           uint16_t /*src_port*/, const void* dst_ip,
+                           uint16_t dst_port_nbo) -> QosmosClassifierPtr {
+      // Record the destination the filter derived, so a test can assert the
+      // Qosmos flow signature carries the REAL destination and not the
+      // listener address.
+      captured_dst_is_v6_ = is_v6;
+      captured_dst_port_ = ntohs(dst_port_nbo);
+      if (!is_v6 && dst_ip != nullptr) {
+        char buf[INET_ADDRSTRLEN] = {};
+        ::inet_ntop(AF_INET, dst_ip, buf, sizeof(buf));
+        captured_dst_ip_ = buf;
+      }
       if (next_factory_returns_null_) {
         return nullptr;
       }
@@ -206,6 +226,9 @@ protected:
   ConfigSharedPtr config_;
   Stats::IsolatedStoreImpl stats_store_;
 
+  std::string captured_dst_ip_;
+  uint16_t captured_dst_port_{0};
+  bool captured_dst_is_v6_{false};
   bool next_factory_alive_{true};
   bool next_factory_returns_null_{false};
   ClassifyResult next_factory_result_{};
@@ -219,6 +242,26 @@ protected:
 };
 
 // ─────────── Verdict tests ───────────
+
+// §13.15 regression. The Qosmos flow signature must carry the destination
+// original_dst restored (localAddress), NOT the address the socket was
+// accepted on (directLocalAddress). The fixture sets them to different
+// values on purpose — 10.10.2.2:80 real vs 10.10.0.1:8443 listener — so a
+// revert to directLocalAddress() fails here loudly.
+//
+// It matters because the tuple is the flow SIGNATURE: qmdpi.h documents that
+// "all mechanisms related to cache or IP classification obtain addresses and
+// ports directly in the flow sig". Feeding the listener address disables
+// Qosmos's IP classification and poisons its internal cache. (It does NOT
+// merge flows — qmdpi_flow_create allocates a fresh context per call.)
+TEST_F(QosmosDpiFilterTest, Regression_FiveTupleUsesRestoredDestination) {
+  next_factory_result_.intermediate_path = "base.ip.tcp.http";
+  runCycle("GET / HTTP/1.1\r\n\r\n");
+
+  EXPECT_FALSE(captured_dst_is_v6_);
+  EXPECT_EQ(captured_dst_ip_, "10.10.2.2");   // NOT 10.10.0.1
+  EXPECT_EQ(captured_dst_port_, 80);          // NOT 8443
+}
 
 TEST_F(QosmosDpiFilterTest, IntermediateHttpRoutesToWebCluster) {
   next_factory_result_.intermediate_path = "base.ip.tcp.http";
@@ -429,13 +472,18 @@ protected:
     ASSERT_TRUE(remote_or.ok());
     ASSERT_TRUE(local_or.ok());
     callbacks_.socket_.connection_info_provider_->setRemoteAddress(*remote_or);
-    // In production `original_dst` runs before qosmos_dpi and populates
-    // directLocalAddress. The cache key reads directLocalAddress, so
-    // set both fields here (the mock's default ctor left directLocalAddress
-    // null).
+    // Model the iptables-REDIRECT shape deliberately: directLocalAddress is
+    // the LISTENER's own ip:port (what the socket was accepted on) while
+    // localAddress is the real destination restored by original_dst, which
+    // runs before us. The two MUST differ here — if they were set to the
+    // same value this fixture could not tell localAddress() apart from
+    // directLocalAddress() and would silently pass with the §13.15 bug
+    // reintroduced. See Regression_CacheKeyUsesRestoredDestination.
     callbacks_.socket_.connection_info_provider_->setLocalAddress(*local_or);
+    auto listener_or = Network::Utility::resolveUrl("tcp://10.10.0.1:8443");
+    ASSERT_TRUE(listener_or.ok());
     callbacks_.socket_.connection_info_provider_->setDirectLocalAddressForTest(
-        *local_or);
+        *listener_or);
 
     ON_CALL(callbacks_, dispatcher()).WillByDefault(ReturnRef(dispatcher_));
 
