@@ -54,6 +54,16 @@ public:
     kRule0NonWebAlpn = 0,
     kRule1TransportHostingAlpn,
     kRule2CsvLookup,
+    // Rule 2 fired, but the matched last token is a TRANSPORT token
+    // (`ssl`, `tcp`, `quic`, `unknown`, …) rather than a real application.
+    // The verdict is identical to kRule2CsvLookup — the CSV value is still
+    // authoritative — but this is NOT an app pin. Callers that read "rule 2
+    // fired" as "the cascade already identified the app" must exclude this
+    // case, or they will suppress refinements that carry strictly more
+    // information (e.g. the SNI). See the FQDN-refine guard in
+    // qosmos_dpi.cc onData, and docs/real-envoy-corpus-vs-poc.md
+    // § "Root cause of the residual non-web→web flips".
+    kRule2CsvLookupTransport,
     kRule3SubstringFallback,
     kRule4DefaultNonWeb,
   };

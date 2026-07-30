@@ -200,6 +200,7 @@ const char* ruleLabel(ProtocolTable::Rule r) {
     case ProtocolTable::Rule::kRule0NonWebAlpn: return "rule0_non_web_alpn";
     case ProtocolTable::Rule::kRule1TransportHostingAlpn: return "rule1_transport_hosting_alpn";
     case ProtocolTable::Rule::kRule2CsvLookup: return "rule2_csv_lookup";
+    case ProtocolTable::Rule::kRule2CsvLookupTransport: return "rule2_csv_lookup_transport";
     case ProtocolTable::Rule::kRule3SubstringFallback: return "rule3_substring_fallback";
     case ProtocolTable::Rule::kRule4DefaultNonWeb: return "rule4_default_non_web";
     case ProtocolTable::Rule::kNone: return "none";
@@ -649,6 +650,82 @@ TEST_F(QosmosCorpusReplayTest, FqdnProbe) {
             << "% of with-sni" << std::endl;
   std::cerr << "[fqdn-probe] wrote " << out_path << std::endl;
   EXPECT_GT(total, 0u);
+}
+
+// Experiment: on the FIRST PDU of a TLS ClientHello, does the engine already
+// know more than `intermediate_path` exposes? The full-corpus run's residual
+// non-web->web flips (52 of 60) all come from a first-PDU read that returned a
+// bare `base.ip.tcp` with no attributes — so the SNI-refine lever cannot fire,
+// even though the SNI is sitting in cleartext in the very bytes we hold.
+//
+// This probes the three cheaper alternatives before resorting to parsing the
+// ClientHello ourselves:
+//   1. qmdpi_result_path_get   (what onData uses today)
+//   2. qmdpi_flow_path_get     (the live flow's own path)
+//   3. qmdpi_result_cached_path_get (the engine's cached classification)
+// plus every registered attribute the result carries (is `ssl:server_name`
+// there at all?).
+//
+// Feed it a hex-encoded client->server segment via $QOSMOS_CH_HEX_FILE.
+TEST_F(QosmosCorpusReplayTest, ClientHelloProbe) {
+  const Config cfg = loadConfig();
+  const std::string hex_file = envOr("QOSMOS_CH_HEX_FILE", "");
+  if (hex_file.empty() || !fs::exists(hex_file)) {
+    GTEST_SKIP() << "set QOSMOS_CH_HEX_FILE to a file of hex bytes (one CTS segment)";
+  }
+  if (!fs::exists(cfg.protocol_table_path)) {
+    GTEST_SKIP() << "protocol table not found: " << cfg.protocol_table_path;
+  }
+
+  std::ifstream in(hex_file);
+  std::string hex((std::istreambuf_iterator<char>(in)),
+                   std::istreambuf_iterator<char>());
+  hex.erase(std::remove_if(hex.begin(), hex.end(),
+                            [](unsigned char c) { return std::isspace(c) != 0; }),
+             hex.end());
+  ASSERT_GE(hex.size(), 2u) << "empty hex input";
+  ASSERT_EQ(hex.size() % 2, 0u) << "odd-length hex input";
+  std::vector<uint8_t> bytes;
+  bytes.reserve(hex.size() / 2);
+  for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+    bytes.push_back(static_cast<uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+  }
+
+  auto engine = std::make_shared<QosmosEngine>(
+      /*engine_config=*/"", /*bundle_path=*/"", cfg.protocol_table_path,
+      /*nb_workers=*/1, tls_, /*verdict_cache_max_entries=*/0,
+      /*total_nb_flows=*/0);
+
+  const uint8_t sip[4] = {10, 0, 0, 2};
+  const uint8_t dip[4] = {1, 1, 1, 1};
+  auto classifier = engine->makeClassifier(/*is_v6=*/false, sip, htons(12345),
+                                            dip, htons(443));
+  ASSERT_TRUE(classifier != nullptr);
+  ASSERT_TRUE(classifier->flowAlive());
+
+  const ClassifyResult r = classifier->classifyPdu(
+      bytes.data(), static_cast<int>(bytes.size()), QMDPI_DIR_CTS, /*tenant=*/0);
+
+  std::cerr << "\n===== ClientHelloProbe (" << bytes.size() << " bytes, PDU 1) =====\n"
+            << "  1. result path (used today) : '" << r.intermediate_path << "'\n"
+            << "  2. flow path                : '" << r.flow_path << "'\n"
+            << "  3. cached path              : '" << r.cached_path << "'\n"
+            << "     final_state              : " << (r.final_state ? "true" : "false")
+            << "   engine_error: " << (r.engine_error ? "true" : "false") << "\n"
+            << "     attributes emitted       : " << r.hooks.size() << "\n";
+  for (const auto& [k, v] : r.hooks) {
+    std::cerr << "       " << k << " = '" << v << "'\n";
+  }
+  // What the engine reaches once the flow is torn down — POC's read-point,
+  // and the upper bound on what any first-PDU lever could recover.
+  const ClassifyResult fin = classifier->finalize();
+  std::cerr << "  4. final path (after destroy — POC's read-point): '"
+            << fin.final_path << "'\n";
+  for (const auto& [k, v] : fin.hooks) {
+    std::cerr << "       " << k << " = '" << v << "'\n";
+  }
+  std::cerr << "=====================================================\n" << std::endl;
+  EXPECT_FALSE(r.engine_error);
 }
 
 }  // namespace
