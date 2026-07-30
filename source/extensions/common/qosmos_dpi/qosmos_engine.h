@@ -38,6 +38,14 @@ struct ClassifyResult {
   // flow); classifyFirstPdu() and finalize() always leave this false because
   // the finality signal is only meaningful before the destroy call.
   bool final_state{false};
+  // Diagnostic probes: the live flow's own classification path
+  // (qmdpi_flow_path_get) and the engine's cached path
+  // (qmdpi_result_cached_path_get). Neither feeds a PDU nor destroys the
+  // flow. Populated by classifyPdu() only. These exist to answer whether the
+  // engine already knows more at PDU 1 than `intermediate_path` exposes —
+  // see docs/real-envoy-corpus-vs-poc.md, the non-web->web residual class.
+  std::string flow_path;
+  std::string cached_path;
 };
 
 // Per-connection classification transaction. Owns a qmdpi_flow* via

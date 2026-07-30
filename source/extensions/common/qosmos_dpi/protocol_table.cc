@@ -210,7 +210,15 @@ std::optional<bool> ProtocolTable::isWebWithRule(absl::string_view path,
   // is the safer error asymmetry.
   if (!last_is_hosting) {
     if (auto it = web_apps_.find(last); it != web_apps_.end()) {
-      rule_out = Rule::kRule2CsvLookup;
+      // Distinguish a real app pin from a CSV row that merely happens to
+      // exist for a transport token (`ssl`, `tcp`, `quic`, `unknown`, …).
+      // The VERDICT is unchanged either way — deliberately, so this stays
+      // behaviour-neutral for every existing caller of isWeb(). Only the
+      // reported rule differs, which lets the FQDN-refine guard tell "the
+      // cascade identified the app" apart from "the cascade only got as far
+      // as the transport".
+      rule_out = last_is_transport ? Rule::kRule2CsvLookupTransport
+                                    : Rule::kRule2CsvLookup;
       return it->second;  // CSV-authoritative web/non-web
     }
   }

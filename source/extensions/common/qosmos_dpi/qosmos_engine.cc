@@ -487,6 +487,13 @@ public:
       // is the very first client byte stream, so ALPN is typically
       // available on the intermediate path already — before flow_destroy.
       extractDiscriminatorHooks(intermediate, result.hooks);
+      // Diagnostic: read the engine's other two views of this flow's
+      // classification, neither of which needs a PDU or a destroy. If either
+      // is more resolved than `intermediate_path` on the first PDU, it is a
+      // cheaper first-packet lever than parsing the ClientHello ourselves.
+      result.flow_path = pathToString(bundle_, qmdpi_flow_path_get(flow_));
+      result.cached_path =
+          pathToString(bundle_, qmdpi_result_cached_path_get(intermediate));
       // Finality signal: set iff the engine has decided nothing new will
       // change the classification given more bytes. Only meaningful on
       // this (pre-destroy) path.

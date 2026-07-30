@@ -368,7 +368,19 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
   //
   // Applied only when the cascade did NOT already pin an app (rule !=
   // kRule2CsvLookup): an app-pinned intermediate path is at least as specific
-  // as the domain, so overriding it could only lose information. This keeps the
+  // as the domain, so overriding it could only lose information.
+  //
+  // NOTE the guard deliberately does NOT exclude kRule2CsvLookupTransport.
+  // Transport tokens (`ssl`, `tcp`, `quic`, `unknown`, …) have CSV rows too,
+  // so rule 2 fires for a bare `base.ip.tcp.ssl` — but that is the cascade
+  // reporting "I only got as far as TLS", not an app pin, and suppressing the
+  // refine there threw away an SNI the engine had already handed us. That was
+  // the root cause of the residual non-web→web flips (52 of 60 in the
+  // 2026-07-30 full-corpus run): a no-ALPN ClientHello scores
+  // `base.ip.tcp.ssl` → rule 2 on the `ssl` row → non-web, refine skipped,
+  // and correction later pins the real app → flip. Hosting tokens are
+  // unaffected: rule 2 is skipped for them entirely, so they already reach
+  // this refine via rule 3/4. This keeps the
   // refinement strictly accuracy-improving (see docs/real-envoy-corpus-vs-poc.md
   // §"Remediation validated": 100% of resolvable-SNI flips resolve to the
   // corrected verdict from the discriminator alone). No config gate — the rule

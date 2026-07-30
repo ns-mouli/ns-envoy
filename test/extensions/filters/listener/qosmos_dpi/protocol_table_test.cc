@@ -19,6 +19,10 @@ namespace {
 // observable in isolation rather than depending on a 5K-entry generated
 // JSON. The full data/qosmos_protocols.json is exercised by the integration
 // test (see qosmos_dpi_integration_test.cc).
+// NB `quic` is deliberately a transport token that is web=TRUE here, mirroring
+// the real qosmos_protocols.json (where `quic` is true while `ssl`/`tcp` are
+// false). It guards against any future "just skip rule 2 for transport tokens"
+// change silently turning QUIC/HTTP3 traffic non-web.
 constexpr absl::string_view kFixtureJson = R"json({
   "version": "test-fixture",
   "transport_tokens":      ["base", "ip", "tcp", "udp", "ssl", "tls", "quic", "unknown"],
@@ -29,6 +33,7 @@ constexpr absl::string_view kFixtureJson = R"json({
   "protocols": [
     { "name": "http",        "web": true  },
     { "name": "ssl",         "web": false },
+    { "name": "quic",        "web": true  },
     { "name": "ftp",         "web": false },
     { "name": "smtp",        "web": false },
     { "name": "websocket",   "web": true  },
@@ -63,7 +68,7 @@ protected:
 TEST_F(ProtocolTableTest, LoadsExpectedShape) {
   auto t = loadFixture();
   EXPECT_EQ(t->version(), "test-fixture");
-  EXPECT_EQ(t->numProtocols(), 8u);
+  EXPECT_EQ(t->numProtocols(), 9u);
 }
 
 TEST_F(ProtocolTableTest, EmptyPathReturnsNullopt) {
@@ -173,6 +178,52 @@ TEST_F(ProtocolTableTest, Rule4_TransportLastTokenWithoutAlpnDefaultsNonWeb) {
   // (transport, then for "unknown" CSV miss), rule 3 no http/websocket
   // substring → rule 4 default non-web.
   EXPECT_EQ(t->isWeb("base.ip.tcp.ssl.unknown", {}), false);
+}
+
+// ── Rule 2: app pin vs transport token (gates the FQDN refine) ──
+//
+// A CSV row exists for transport tokens (`ssl`, `tcp`, `quic`, …) as well as
+// for real apps. Rule 2 must report which kind it matched, so the FQDN-refine
+// guard in qosmos_dpi.cc onData can tell "the cascade identified the app"
+// apart from "the cascade only got as far as the transport". The VERDICT is
+// identical in both cases — these tests pin that.
+
+TEST_F(ProtocolTableTest, Rule2_TransportTokenReportsTransportVariant) {
+  auto t = loadFixture();
+  ProtocolTable::Rule r = ProtocolTable::Rule::kNone;
+  // `ssl` is web=false in the CSV but is a transport token, not an app.
+  EXPECT_EQ(t->isWebWithRule("base.ip.tcp.ssl", {}, r), false);
+  EXPECT_EQ(r, ProtocolTable::Rule::kRule2CsvLookupTransport);
+}
+
+TEST_F(ProtocolTableTest, Rule2_RealAppStillReportsAppPin) {
+  auto t = loadFixture();
+  ProtocolTable::Rule r = ProtocolTable::Rule::kNone;
+  EXPECT_EQ(t->isWebWithRule("base.ip.tcp.http", {}, r), true);
+  EXPECT_EQ(r, ProtocolTable::Rule::kRule2CsvLookup);
+}
+
+TEST_F(ProtocolTableTest, Rule2_TransportRelabelDoesNotChangeQuicVerdict) {
+  auto t = loadFixture();
+  ProtocolTable::Rule r = ProtocolTable::Rule::kNone;
+  // quic is web=TRUE in the CSV. The relabel must not turn it non-web —
+  // only the reported rule may differ.
+  EXPECT_EQ(t->isWebWithRule("base.ip.udp.quic", {}, r), true);
+  EXPECT_EQ(r, ProtocolTable::Rule::kRule2CsvLookupTransport);
+}
+
+TEST_F(ProtocolTableTest, Rule2_HostingTokensUnaffectedByTransportRelabel) {
+  auto t = loadFixture();
+  ProtocolTable::Rule r = ProtocolTable::Rule::kNone;
+  // Hyperscaler/CDN-hosted services: hosting tokens are skipped ABOVE the
+  // transport check and never reach rule 2, so AWS/GCP/Cloudflare behaviour
+  // is untouched — rule 4 without an HTTP ALPN, rule 1 with one.
+  EXPECT_EQ(t->isWebWithRule("base.ip.tcp.ssl.amazon_aws", {}, r), false);
+  EXPECT_EQ(r, ProtocolTable::Rule::kRule4DefaultNonWeb);
+  EXPECT_EQ(t->isWebWithRule("base.ip.tcp.ssl.cloudflare", {}, r), false);
+  EXPECT_EQ(r, ProtocolTable::Rule::kRule4DefaultNonWeb);
+  EXPECT_EQ(t->isWebWithRule("base.ip.tcp.ssl.gcp", alpn("h2"), r), true);
+  EXPECT_EQ(r, ProtocolTable::Rule::kRule1TransportHostingAlpn);
 }
 
 // ── Loader error paths ──
