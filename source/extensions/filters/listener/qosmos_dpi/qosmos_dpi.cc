@@ -451,6 +451,15 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
   // the same discriminator has already been promoted to final.
   if (cache_available) {
     cache_key_ = computeCacheKeyFromHooks(dst_addr_, cr.hooks);
+    // Log the discriminator KIND. Sni/HttpHost name the destination, so a
+    // shared key there is mostly benign; Ja4 fingerprints the CLIENT's TLS
+    // stack and Plain has an empty discriminator by construction, so those
+    // two are the kinds that can conflate unrelated destinations if the
+    // dst component is ever weak (see §13.15). Without this the corpus runs
+    // can only infer the blast radius from an owners shortfall.
+    ENVOY_LOG(debug, "qosmos_dpi: cache-key kind={} dst={}:{} discriminator='{}'",
+              discriminatorKindName(cache_key_.kind), cache_key_.dst_ip,
+              cache_key_.dst_port, cache_key_.discriminator_value);
   }
 
   // ── Cache short-circuit: hit with final_seen=true ──
