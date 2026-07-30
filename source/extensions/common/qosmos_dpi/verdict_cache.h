@@ -33,6 +33,21 @@ enum class DiscriminatorKind : uint8_t {
   Plain = 3,
 };
 
+// Stable short names for logging/analysis. Sni and HttpHost name the
+// DESTINATION, so sharing a key on them is mostly benign; Ja4 fingerprints
+// the CLIENT's TLS stack and Plain carries no discriminator at all, so those
+// two are the kinds that can conflate unrelated destinations. Keep these
+// strings stable — corpus log analysis greps them.
+inline const char* discriminatorKindName(DiscriminatorKind k) {
+  switch (k) {
+  case DiscriminatorKind::Sni:      return "sni";
+  case DiscriminatorKind::Ja4:      return "ja4";
+  case DiscriminatorKind::HttpHost: return "host";
+  case DiscriminatorKind::Plain:    return "plain";
+  }
+  return "unknown";
+}
+
 // Cache key: dst-ip + dst-port + optional discriminator (SNI when the
 // TLS listener filter has one; otherwise Plain). Every field is const
 // after construction so hashing is stable.
