@@ -87,11 +87,11 @@ ProtocolTable::loadJson(const std::string& path) {
 
     return table;
   }
+  END_TRY
   CATCH(const EnvoyException& e, {
     return absl::InvalidArgumentError(
         "qosmos_dpi: failed to parse " + path + ": " + std::string(e.what()));
-  })
-  END_TRY
+  });
 }
 
 namespace {
