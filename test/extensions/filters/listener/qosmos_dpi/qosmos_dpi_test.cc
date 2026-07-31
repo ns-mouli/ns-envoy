@@ -160,15 +160,14 @@ protected:
     ASSERT_TRUE(remote_or.ok());
     ASSERT_TRUE(local_or.ok());
     callbacks_.socket_.connection_info_provider_->setRemoteAddress(*remote_or);
-    // localAddress = real destination (restored by original_dst, which is
-    // ordered before us); directLocalAddress = the listener's own ip:port,
-    // as under iptables REDIRECT. They MUST differ so the fixture can tell
-    // the two accessors apart — see §13.15 / readFiveTuple.
+    // localAddress = real destination, restored by original_dst (ordered
+    // before us) via restoreLocalAddress(). v1.32.4's ConnectionInfoProvider
+    // has no directLocalAddress() concept at all (no getter, no setter) —
+    // unlike main, where the distinct accessor made a same-vs-different-value
+    // regression test meaningful. Here, reverting to a nonexistent
+    // directLocalAddress() simply fails to compile, so the compiler is the
+    // regression guard; see §13.15 / readFiveTuple.
     callbacks_.socket_.connection_info_provider_->setLocalAddress(*local_or);
-    auto listener_or = Network::Utility::resolveUrl("tcp://10.10.0.1:8443");
-    ASSERT_TRUE(listener_or.ok());
-    callbacks_.socket_.connection_info_provider_->setDirectLocalAddressForTest(
-        *listener_or);
 
     // Filter calls dispatcher() to arm the silence timer; return our mock.
     ON_CALL(callbacks_, dispatcher()).WillByDefault(ReturnRef(dispatcher_));
@@ -244,10 +243,10 @@ protected:
 // ─────────── Verdict tests ───────────
 
 // §13.15 regression. The Qosmos flow signature must carry the destination
-// original_dst restored (localAddress), NOT the address the socket was
-// accepted on (directLocalAddress). The fixture sets them to different
-// values on purpose — 10.10.2.2:80 real vs 10.10.0.1:8443 listener — so a
-// revert to directLocalAddress() fails here loudly.
+// original_dst restored via localAddress() — 10.10.2.2:80 in this fixture.
+// v1.32.4 has no directLocalAddress() at all, so a revert to it fails to
+// compile rather than failing this assertion; this test still pins the
+// correct value flows into the Qosmos signature.
 //
 // It matters because the tuple is the flow SIGNATURE: qmdpi.h documents that
 // "all mechanisms related to cache or IP classification obtain addresses and
@@ -472,18 +471,12 @@ protected:
     ASSERT_TRUE(remote_or.ok());
     ASSERT_TRUE(local_or.ok());
     callbacks_.socket_.connection_info_provider_->setRemoteAddress(*remote_or);
-    // Model the iptables-REDIRECT shape deliberately: directLocalAddress is
-    // the LISTENER's own ip:port (what the socket was accepted on) while
     // localAddress is the real destination restored by original_dst, which
-    // runs before us. The two MUST differ here — if they were set to the
-    // same value this fixture could not tell localAddress() apart from
-    // directLocalAddress() and would silently pass with the §13.15 bug
-    // reintroduced. See Regression_CacheKeyUsesRestoredDestination.
+    // runs before us. v1.32.4 has no directLocalAddress() concept at all
+    // (see the SetUp() comment in QosmosDpiFilterTest above), so unlike
+    // main there is no second accessor to accidentally read — a revert
+    // fails to compile. See Regression_CacheKeyUsesRestoredDestination.
     callbacks_.socket_.connection_info_provider_->setLocalAddress(*local_or);
-    auto listener_or = Network::Utility::resolveUrl("tcp://10.10.0.1:8443");
-    ASSERT_TRUE(listener_or.ok());
-    callbacks_.socket_.connection_info_provider_->setDirectLocalAddressForTest(
-        *listener_or);
 
     ON_CALL(callbacks_, dispatcher()).WillByDefault(ReturnRef(dispatcher_));
 
