@@ -60,7 +60,7 @@ using ClassifierFactory =
 //                             defaulted to non-web/CFW
 //   engine_error              qmdpi_* returned error during classification
 //   flows_released_at_verdict releaseFlow() called from a verdict path
-//   flows_released_at_close   releaseFlow() called from onClose belt-and-braces
+//   flows_released_at_close   releaseFlow() called from ~Filter belt-and-braces
 //                             (rare — client disconnected before any verdict)
 //   bytes_processed           histogram of bytes_inspected per connection
 //   verdict_cache_hit         onAccept lookup found an existing entry; DPI
@@ -200,9 +200,13 @@ using ConfigSharedPtr = std::shared_ptr<Config>;
 //                 return Continue (filter is done)
 //   silence    →  setVerdict(non_web), continueFilterChain(true).
 //                 ~classifier_ destroys the unused flow.
-//   onClose    →  ~classifier_ destroys the flow if still alive
+//   ~Filter    →  ~classifier_ destroys the flow if still alive
 //                 (belt-and-braces; rare — connection closed before
-//                 first byte AND before silence_timeout fired).
+//                 first byte AND before silence_timeout fired). v1.32.4's
+//                 Network::ListenerFilter has no onClose() hook (only
+//                 onAccept/onData/maxReadBytes), so this cleanup — silence
+//                 timer disarm + classifier teardown — lives entirely in
+//                 the destructor.
 //
 // Default verdict on any inconclusive / null / error path is non-web (CFW).
 class Filter : public Network::ListenerFilter,
@@ -215,7 +219,6 @@ public:
   Network::FilterStatus onAccept(Network::ListenerFilterCallbacks& cb) override;
   Network::FilterStatus onData(Network::ListenerFilterBuffer& buffer) override;
   size_t maxReadBytes() const override { return config_->maxInspectBytes(); }
-  void onClose() override;
 
 private:
   // Silence-timer callback. Invoked when no client bytes arrived within

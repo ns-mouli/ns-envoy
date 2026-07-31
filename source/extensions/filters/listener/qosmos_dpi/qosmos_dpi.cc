@@ -229,6 +229,11 @@ Config::verdictCacheForThisThread() const {
 Filter::Filter(ConfigSharedPtr config) : config_(std::move(config)) {}
 
 Filter::~Filter() {
+  // v1.32.4's Network::ListenerFilter has no onClose() hook, so the
+  // silence-timer disarm that used to happen there now happens here too.
+  if (silence_timer_ != nullptr) {
+    silence_timer_->disableTimer();
+  }
   recordClassifierDestruction();
 }
 
@@ -631,15 +636,6 @@ void Filter::setVerdict(absl::string_view cluster_name, bool is_web) {
       std::make_unique<TcpProxy::PerConnectionCluster>(cluster_name),
       StreamInfo::FilterState::StateType::Mutable,
       StreamInfo::FilterState::LifeSpan::Connection);
-}
-
-void Filter::onClose() {
-  if (silence_timer_ != nullptr) {
-    silence_timer_->disableTimer();
-  }
-  // ~classifier_ in ~Filter handles the actual qmdpi_flow_destroy via RAII.
-  // Nothing else to do here; recordClassifierDestruction in ~Filter
-  // updates the released-at-close stat.
 }
 
 }  // namespace QosmosDpi
