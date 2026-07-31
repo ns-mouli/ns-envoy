@@ -3,6 +3,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "source/common/common/thread.h"
 #include "source/common/json/json_loader.h"
 
 #include "absl/strings/ascii.h"
@@ -31,19 +32,15 @@ absl::StatusOr<std::string> slurpFile(const std::string& path) {
 }
 
 // Helper: load a JSON top-level array of strings into a string container.
+// v1.32.4's Json::Object getters throw Json::Exception on malformed input
+// (no …NoThrow variants besides getObjectNoThrow) — this propagates up to
+// the TRY_NEEDS_AUDIT/CATCH in loadJson() below, which is the only caller.
 template <typename Container>
-absl::Status loadStringArray(const Json::Object& root, const std::string& field,
-                             Container& out) {
-  auto items_or = root.getStringArray(field, /*allow_empty=*/true);
-  if (!items_or.ok()) {
-    return absl::InvalidArgumentError(
-        "qosmos_dpi: missing or malformed JSON array '" + field +
-        "': " + std::string(items_or.status().message()));
-  }
-  for (const auto& s : *items_or) {
+void loadStringArray(const Json::Object& root, const std::string& field,
+                     Container& out) {
+  for (const auto& s : root.getStringArray(field, /*allow_empty=*/true)) {
     out.insert(out.end(), absl::AsciiStrToLower(s));
   }
-  return absl::OkStatus();
 }
 
 }  // namespace
@@ -53,56 +50,48 @@ ProtocolTable::loadJson(const std::string& path) {
   auto json_or = slurpFile(path);
   if (!json_or.ok()) return json_or.status();
 
-  auto root_or = Json::Factory::loadFromString(*json_or);
-  if (!root_or.ok()) {
-    return absl::InvalidArgumentError(
-        "qosmos_dpi: failed to parse " + path + ": " +
-        std::string(root_or.status().message()));
-  }
-  const auto& root = **root_or;
-
-  auto table = std::unique_ptr<ProtocolTable>(new ProtocolTable());
-
-  // version is informational; tolerate absence.
-  auto v_or = root.getString("version", "unknown");
-  table->version_ = v_or.ok() ? *v_or : "unknown";
-
-  // Token sets / ordered lists.
-  if (auto s = loadStringArray(root, "transport_tokens", table->transport_tokens_);
-      !s.ok()) return s;
-  if (auto s = loadStringArray(root, "hosting_tokens", table->hosting_tokens_);
-      !s.ok()) return s;
-  if (auto s = loadStringArray(root, "non_web_alpn_prefixes",
-                                table->non_web_alpn_prefixes_); !s.ok()) return s;
-  if (auto s = loadStringArray(root, "http_alpn_prefixes",
-                                table->http_alpn_prefixes_); !s.ok()) return s;
-  if (auto s = loadStringArray(root, "web_substring_tokens",
-                                table->web_substring_tokens_); !s.ok()) return s;
-
-  // Per-protocol web_apps_ map.
-  auto protos_or = root.getObjectArray("protocols", /*allow_empty=*/false);
-  if (!protos_or.ok()) {
-    return absl::InvalidArgumentError(
-        "qosmos_dpi: missing or empty 'protocols' array in " + path + ": " +
-        std::string(protos_or.status().message()));
-  }
-  table->web_apps_.reserve(protos_or->size());
-  for (const auto& proto : *protos_or) {
-    auto name_or = proto->getString("name");
-    if (!name_or.ok()) {
+  // v1.32.4's whole Json::Object getter surface (getString, getStringArray,
+  // getObjectArray, getBoolean, getObject) throws Json::Exception rather
+  // than returning StatusOr — unlike main, where it's all StatusOr-based.
+  // Wrap the body in one TRY/CATCH instead of per-call status checks; every
+  // Json::Exception funnels into the same absl::InvalidArgumentError.
+  TRY_NEEDS_AUDIT {
+    auto root_or = Json::Factory::loadFromStringNoThrow(*json_or);
+    if (!root_or.ok()) {
       return absl::InvalidArgumentError(
-          "qosmos_dpi: protocol entry missing 'name' string in " + path);
+          "qosmos_dpi: failed to parse " + path + ": " +
+          std::string(root_or.status().message()));
     }
-    auto web_or = proto->getBoolean("web", false);
-    if (!web_or.ok()) {
-      return absl::InvalidArgumentError(
-          "qosmos_dpi: protocol '" + *name_or +
-          "' has malformed 'web' field in " + path);
-    }
-    table->web_apps_[absl::AsciiStrToLower(*name_or)] = *web_or;
-  }
+    const auto& root = **root_or;
 
-  return table;
+    auto table = std::unique_ptr<ProtocolTable>(new ProtocolTable());
+
+    // version is informational; tolerate absence.
+    table->version_ = root.getString("version", "unknown");
+
+    // Token sets / ordered lists.
+    loadStringArray(root, "transport_tokens", table->transport_tokens_);
+    loadStringArray(root, "hosting_tokens", table->hosting_tokens_);
+    loadStringArray(root, "non_web_alpn_prefixes", table->non_web_alpn_prefixes_);
+    loadStringArray(root, "http_alpn_prefixes", table->http_alpn_prefixes_);
+    loadStringArray(root, "web_substring_tokens", table->web_substring_tokens_);
+
+    // Per-protocol web_apps_ map.
+    auto protos = root.getObjectArray("protocols", /*allow_empty=*/false);
+    table->web_apps_.reserve(protos.size());
+    for (const auto& proto : protos) {
+      const std::string name = proto->getString("name");
+      const bool web = proto->getBoolean("web", false);
+      table->web_apps_[absl::AsciiStrToLower(name)] = web;
+    }
+
+    return table;
+  }
+  CATCH(const EnvoyException& e, {
+    return absl::InvalidArgumentError(
+        "qosmos_dpi: failed to parse " + path + ": " + std::string(e.what()));
+  })
+  END_TRY
 }
 
 namespace {

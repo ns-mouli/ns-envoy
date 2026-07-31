@@ -25,6 +25,7 @@ envoy_cc_library(
     srcs = ["protocol_table.cc"],
     hdrs = ["protocol_table.h"],
     deps = [
+        "//source/common/common:thread_lib",
         "//source/common/json:json_loader_lib",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
