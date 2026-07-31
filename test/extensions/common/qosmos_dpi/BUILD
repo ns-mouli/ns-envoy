@@ -26,9 +26,9 @@ envoy_cc_test_library(
     srcs = ["pcap_reader.cc"],
     hdrs = ["pcap_reader.h"],
     deps = [
-        "@abseil-cpp//absl/container:flat_hash_map",
-        "@abseil-cpp//absl/status:statusor",
-        "@abseil-cpp//absl/strings",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@system_libpcap//:pcap",
     ],
 )
@@ -58,10 +58,6 @@ envoy_cc_test(
         "//source/extensions/common/qosmos_dpi:qosmos_engine_lib",
         "//test/mocks/event:event_mocks",
         "//test/mocks/thread_local:thread_local_mocks",
-        # Pin the newer abseil-cpp copy so protobuf's coded_stream.h chain
-        # sees `absl_nonnull`/`absl_nullable` macros consistently across the
-        # two Envoy abseil repos.
-        "@abseil-cpp//absl/base:nullability",
         "@qosmos_sdk//:qmdpi",
     ],
 )
