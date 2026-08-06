@@ -1,10 +1,8 @@
-load("@base_pip3//:requirements.bzl", "requirement")
 load("@rules_cc//cc:defs.bzl", "cc_library")
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_contrib_extension",
     "envoy_cc_library",
-    "envoy_cmake",
     "envoy_contrib_package",
 )
 
@@ -14,76 +12,25 @@ licenses(["notice"])  # Apache 2
 
 envoy_contrib_package()
 
+# Copy only the VCL header from /opt/vpp23 — the VPP shared libs
+# (libvppcom.so, libvppinfra.so, etc.) are linked dynamically via
+# --linkopt flags in clang.bazelrc. The .so files are copied into
+# the Docker image at packaging time.
+genrule(
+    name = "vppcom_header",
+    srcs = [],
+    outs = ["external/vppcom.h"],
+    cmd = "mkdir -p $(RULEDIR)/external && " +
+          "cp /opt/vpp23/include/vcl/vppcom.h $(RULEDIR)/external/",
+)
+
 cc_library(
     name = "vpp_vcl",
-    srcs = [
-        "external/libsvm.a",
-        "external/libvlibapi.a",
-        "external/libvlibmemoryclient.a",
-        "external/libvppcom.a",
-        "external/libvppinfra.a",
-        "external/vppcom.h",
-    ],
     hdrs = ["external/vppcom.h"],
     defines = ["VPP_VCL"],
     includes = ["external/"],
     tags = ["skip_on_windows"],
     visibility = ["//visibility:public"],
-)
-
-envoy_cmake(
-    name = "build",
-    build_data = [requirement("ply")],
-    cache_entries = {
-        "CMAKE_BUILD_TYPE": "Release",
-        "VPP_API_TEST_BUILTIN": "OFF",
-        "BUILD_SHARED_LIBS": "OFF",
-        "CMAKE_ENABLE_EXPORTS": "OFF",
-    },
-    copts = ["-Wno-unused-variable"],
-    default_cache_entries = {},
-    env = {
-        "PLYPATHS": "$(locations %s)" % requirement("ply"),
-    },
-    lib_source = "@com_github_fdio_vpp_vcl//:all",
-    linkopts = ["-Wno-unused-variable"],
-    out_static_libs = [
-        "libvppcom.a",
-        "libvppinfra.a",
-        "libsvm.a",
-        "libvlibapi.a",
-        "libvlibmemoryclient.a",
-    ],
-    postfix_script = """
-        mkdir -p $INSTALLDIR/lib/external $INSTALLDIR/include/external \
-        && find . -name "*.a" | xargs -I{} cp -a {} $INSTALLDIR/lib/ \
-        && find . -name "*.h" ! -name config.h | xargs -I{} cp -a {} $INSTALLDIR/include
-    """,
-    tags = [
-        "cpu:16",
-        "skip_on_windows",
-    ],
-    targets = [
-        "vppcom",
-    ],
-    working_directory = "src",
-)
-
-genrule(
-    name = "build_files",
-    outs = [
-        "external/libsvm.a",
-        "external/libvlibapi.a",
-        "external/libvlibmemoryclient.a",
-        "external/libvppcom.a",
-        "external/libvppinfra.a",
-        "external/vppcom.h",
-    ],
-    cmd = """
-        find . -name "*.a" | grep -v copy_build | xargs -I{} cp -a {} $(RULEDIR)/external \
-        && find . -name "vppcom.h" | grep -v copy_build | xargs -I{} cp -a {} $(RULEDIR)/external
-    """,
-    tools = [":build"],
 )
 
 envoy_cc_library(

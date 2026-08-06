@@ -13,6 +13,8 @@
 #include "envoy/service/runtime/v3/rtds.pb.h"
 #include "envoy/service/secret/v3/sds.pb.h"
 
+#include "envoy/extensions/filters/listener/qosmos_dpi/v3/qosmos_dpi.pb.h"
+
 // API_NO_BOOST_FILE
 
 namespace Envoy {
@@ -30,5 +32,12 @@ const envoy::service::route::v3::SrdsDummy _srds_dummy_v3;
 const envoy::service::extension::v3::EcdsDummy _ecds_dummy_v3;
 const envoy::service::runtime::v3::RtdsDummy _rtds_dummy_v3;
 const envoy::service::health::v3::HdsDummy _hds_dummy_v3;
+
+// Force-link Qosmos DPI listener filter proto descriptor. The filter is loaded
+// via typed_config @type lookup at runtime; without this dummy reference,
+// --gc-sections drops the proto's .init_array entry and AddDescriptors is
+// never called, causing "could not find @type ...QosmosDpi" at startup.
+const envoy::extensions::filters::listener::qosmos_dpi::v3::QosmosDpi
+    _qosmos_dpi_dummy_v3;
 
 } // namespace Envoy

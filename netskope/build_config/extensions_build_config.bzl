@@ -50,11 +50,12 @@ EXTENSIONS = {
     "envoy.matching.inputs.filter_state":               "//source/extensions/matching/network/common:inputs_lib",
 
     #
-    # Listener filters -- ONLY the four we actually need
+    # Listener filters -- the five we need (proxy_protocol for VCL PP2 orig_dst)
     #
     "envoy.filters.listener.original_dst":              "//source/extensions/filters/listener/original_dst:config",
     "envoy.filters.listener.tls_inspector":             "//source/extensions/filters/listener/tls_inspector:config",
     "envoy.filters.listener.qosmos_dpi":                "//source/extensions/filters/listener/qosmos_dpi:config",
+    "envoy.filters.listener.proxy_protocol":            "//source/extensions/filters/listener/proxy_protocol:config",
 
     #
     # Network filters -- tcp_proxy + qosmos_dpi_correction (Part E of the
@@ -116,6 +117,12 @@ EXTENSIONS = {
     #
     "envoy.key_value.file_based":     "//source/extensions/key_value/file_based:config_lib",
 
+    #
+    # VCL-specific bootstrap + IO socket extensions
+    #
+    "envoy.io_socket.user_space":                      "//source/extensions/io_socket/user_space:config",
+    "envoy.bootstrap.internal_listener":               "//source/extensions/bootstrap/internal_listener:config",
+
     # -----------------------------------------------------------------
     # Everything below this line is commented out relative to the
     # upstream extensions_build_config.bzl. Includes:
@@ -137,7 +144,6 @@ EXTENSIONS = {
     #   - all string matchers (lua), lua filters
     #   - all formatters beyond built-in
     #   - all geoip / maxmind
-    #   - all bootstrap.internal_listener, io_socket.user_space
     #   - all path pattern match/rewrite, cluster specifier plugins
     #   - all content parsers (json), rate limit descriptors
     #   - all health checkers (topology uses no active hc)

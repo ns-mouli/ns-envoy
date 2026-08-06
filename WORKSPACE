@@ -38,7 +38,7 @@ envoy_dependency_imports_extra()
 # §6 for rationale.
 new_local_repository(
     name = "qosmos_sdk",
-    path = "/opt/3p/binary/ixe",
+    path = "/tmp/qosmos_sdk_local",  # licensed + symbol-localized copy
     build_file_content = """
 package(default_visibility = ["//visibility:public"])
 

@@ -20,6 +20,19 @@ extern "C" {
 #include "qmdpi_const.h"  // QMDPI_DIR_CTS
 }
 
+// Forward declaration — VCL verdict push is defined after the namespace close
+// to avoid vcl_io_handle.h namespace pollution (it introduces Envoy::Extensions::Network
+// which would shadow Envoy::Network::FilterStatus inside the QosmosDpi namespace).
+namespace Envoy {
+namespace Extensions {
+namespace ListenerFilters {
+namespace QosmosDpi {
+void qosmos_dpi_push_verdict(::Envoy::Network::IoHandle& io, bool is_web);
+}
+}
+}
+}
+
 namespace Envoy {
 namespace Extensions {
 namespace ListenerFilters {
@@ -335,6 +348,27 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
   const auto slice = buffer.rawSlice();
   config_->stats().bytes_processed_.recordValue(static_cast<uint64_t>(slice.len_));
 
+  // Skip inline_conn_info metadata prepended by prior service (socksproxy/ctap).
+  // Format: [4-byte hdr: m_msgLen(u16) + m_version(u16=3)] [TLVs...] [EOD]
+  // Without skipping, Qosmos sees the metadata instead of HTTP/TLS and
+  // returns base.ip.tcp (can't identify the protocol).
+  // We only skip for classification — the buffer and TCP seq/ack are NOT
+  // modified. tcp_proxy still forwards the full stream; downstream services
+  // (iproxy/appfwl) handle inline_conn_info in their own adapters.
+  const uint8_t* data = static_cast<const uint8_t*>(slice.mem_);
+  int data_len = static_cast<int>(slice.len_);
+  if (data_len >= 4) {
+    uint16_t meta_version = (data[2] << 8) | data[3];
+    if (meta_version == 3) {  // INLINE_CONN_INFO_VERSION_3
+      uint16_t meta_len = (data[0] << 8) | data[1];
+      if (meta_len > 0 && meta_len < data_len) {
+        ENVOY_LOG(debug, "qosmos_dpi: skipping inline_conn_info len={}", meta_len);
+        data += meta_len;
+        data_len -= meta_len;
+      }
+    }
+  }
+
   auto* cache = config_->verdictCacheForThisThread();
   const bool cache_available = cache != nullptr && !dst_addr_.ip.empty();
 
@@ -345,12 +379,12 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
   ClassifyResult cr;
   if (cache_available) {
     cr = classifier_->classifyPdu(
-        slice.mem_, static_cast<int>(slice.len_), QMDPI_DIR_CTS,
+        data, data_len, QMDPI_DIR_CTS,
         static_cast<int>(config_->defaultTenantId()));
     bytes_peeked_this_pdu_ = slice.len_;
   } else {
     cr = classifier_->classifyFirstPdu(
-        slice.mem_, static_cast<int>(slice.len_), QMDPI_DIR_CTS,
+        data, data_len, QMDPI_DIR_CTS,
         static_cast<int>(config_->defaultTenantId()));
   }
   classify_invoked_ = true;
@@ -630,6 +664,12 @@ void Filter::setVerdict(absl::string_view cluster_name, bool is_web) {
     config_->stats().non_web_classified_.inc();
   }
 
+  // Push verdict to VPP via VCL ctrl_mq so ns-envoy-adapter can set
+  // fctx->is_web for iproxy skip/keep routing in the NSH service chain.
+  if (cb_ != nullptr) {
+    qosmos_dpi_push_verdict(cb_->socket().ioHandle(), is_web);
+  }
+
   if (cb_ == nullptr) return;
   cb_->filterState().setData(
       TcpProxy::PerConnectionCluster::key(),
@@ -642,3 +682,24 @@ void Filter::setVerdict(absl::string_view cluster_name, bool is_web) {
 }  // namespace ListenerFilters
 }  // namespace Extensions
 }  // namespace Envoy
+
+// VCL verdict push implementation — outside all namespaces to avoid
+// vcl_io_handle.h namespace pollution. The VCL header introduces
+// Envoy::Extensions::Network which would shadow Envoy::Network inside
+// the QosmosDpi namespace (causing Network::FilterStatus lookup failures).
+#include "contrib/vcl/source/vcl_io_handle.h"
+
+extern "C" {
+// vppcom_set_verdict is added by Netskope VPP patches — not in upstream
+// vppcom.h. Declare it here since the prebuilt /opt/vpp23 header may not
+// have it.
+extern int vppcom_set_verdict(int fd, uint8_t is_web);
+}
+
+void Envoy::Extensions::ListenerFilters::QosmosDpi::qosmos_dpi_push_verdict(
+    ::Envoy::Network::IoHandle& io, bool is_web) {
+  auto* vcl_io = dynamic_cast<Envoy::Extensions::Network::Vcl::VclIoHandle*>(&io);
+  if (vcl_io) {
+    vppcom_set_verdict(vcl_io->sh(), is_web ? 1 : 0);
+  }
+}

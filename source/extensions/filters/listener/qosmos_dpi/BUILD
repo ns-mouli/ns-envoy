@@ -30,6 +30,7 @@ envoy_cc_library(
     srcs = ["qosmos_dpi.cc"],
     hdrs = ["qosmos_dpi.h"],
     deps = [
+        "//contrib/vcl/source:vcl_interface_lib",
         "//source/extensions/common/qosmos_dpi:qosmos_engine_lib",
         "//source/extensions/common/qosmos_dpi:qosmos_flow_handoff_lib",
         "//source/extensions/common/qosmos_dpi:verdict_cache_lib",

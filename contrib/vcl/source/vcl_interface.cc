@@ -45,6 +45,9 @@ void onMqSocketEvents(uint32_t flags) {
   while (max_events > 0) {
     int n_events = vppcom_epoll_wait(epoll_fd, events, max_events, 0);
     if (n_events <= 0) {
+      if (n_events < 0) {
+        ENVOY_LOG_MISC(warn, "[{}] vppcom_epoll_wait returned error: {}", wrk_index, n_events);
+      }
       break;
     }
     max_events -= n_events;
@@ -58,6 +61,7 @@ void onMqSocketEvents(uint32_t flags) {
 
       // session closed due to some recently processed event
       if (!vcl_handle->isOpen()) {
+        ENVOY_LOG_MISC(debug, "[{}] skipping closed session sh={:x}", wrk_index, vcl_handle->sh());
         continue;
       }
 
