@@ -49,6 +49,14 @@ objcopy --localize-symbol=huff_sym_table \
         --localize-symbol=huff_decode_table \
         $QOSMOS_LOCAL/lib/libqmbundle.fpic.a
 
+# Apply Qosmos license patch to libqmengine.fpic.a
+if [ -f /home/rkumark/ws/cfw-demux-svc/envoy-qosmos/docs/Q1800801-20181221.bin ]; then
+    echo "[ns-envoy-vcl] Applying Qosmos license patch ..."
+    perl /opt/3p/binary/ixe/src/tools/license_patcher/license_patcher.pl \
+        /home/rkumark/ws/cfw-demux-svc/envoy-qosmos/docs/Q1800801-20181221.bin \
+        $QOSMOS_LOCAL/lib/libqmengine.fpic.a
+fi
+
 # --- 2. Set up Clang/LLD ---
 if [ -L /usr/local/bin/clang ]; then
     export PATH="/usr/local/bin:$PATH"

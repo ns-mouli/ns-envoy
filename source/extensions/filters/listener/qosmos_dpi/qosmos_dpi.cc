@@ -231,7 +231,10 @@ Config::Config(const ProtoConfig& proto, ClassifierFactory factory,
 
 Extensions::Common::QosmosDpi::VerdictCache*
 Config::verdictCacheForThisThread() const {
-  if (!verdict_cache_correction_enabled_) return nullptr;
+  // Cache is available when either:
+  //  - correction is enabled (original design), OR
+  //  - cache is allocated with total_entries > 0 (VCL pipeline: use cache
+  //    without correction, promote entries to final immediately)
   if (test_verdict_cache_ != nullptr) return test_verdict_cache_;
   if (engine_ == nullptr || !engine_->verdictCacheEnabled()) return nullptr;
   return &engine_->cacheForThisThread();
@@ -372,12 +375,13 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
   auto* cache = config_->verdictCacheForThisThread();
   const bool cache_available = cache != nullptr && !dst_addr_.ip.empty();
 
-  // When the cache is available we call classifyPdu (no flow_destroy) so
-  // the correction network filter — or this filter's own short-circuit
-  // branch below — controls the flow's fate. Otherwise, preserve today's
-  // classifyFirstPdu shape (single-shot, immediate flow_destroy).
+  // When the cache is available AND correction is enabled, we call
+  // classifyPdu (no flow_destroy) so the correction network filter controls
+  // the flow's fate. When correction is disabled (VCL pipeline — no
+  // correction filter), use classifyFirstPdu (single-shot, immediate
+  // flow_destroy) even with cache, to avoid QosmosFlowHandoff delays.
   ClassifyResult cr;
-  if (cache_available) {
+  if (cache_available && config_->verdictCacheCorrectionEnabled()) {
     cr = classifier_->classifyPdu(
         data, data_len, QMDPI_DIR_CTS,
         static_cast<int>(config_->defaultTenantId()));
@@ -565,37 +569,50 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
     } else {
       config_->stats().verdict_cache_miss_.inc();
     }
-    if (!cache->put(cache_key_, verdict_is_web, "4pkt")) {
-      config_->stats().verdict_cache_reject_full_.inc();
-    }
-    config_->stats().verdict_cache_size_.set(cache->size());
 
-    if (cr.final_state) {
-      // Rare: the engine already reached a final classification on this
-      // very first PDU. Nothing to correct — finalize the flow here and
-      // don't burden the correction filter with a hand-off. Also promote
-      // the cache entry to final immediately.
+    // When correction is disabled (VCL pipeline), promote to final
+    // immediately — no correction filter to refine the verdict later.
+    // When correction is enabled, keep initial state and hand off.
+    if (!config_->verdictCacheCorrectionEnabled()) {
       cache->put(cache_key_, verdict_is_web, "final");
+      if (!cache->put(cache_key_, verdict_is_web, "final")) {
+        config_->stats().verdict_cache_reject_full_.inc();
+      }
+      config_->stats().verdict_cache_size_.set(cache->size());
       classifier_->finalize();
     } else {
-      // Park the live classifier in FilterState for the correction filter
-      // to pick up on the network-filter side. If no correction filter is
-      // present in filter_chains, ~QosmosFlowHandoff will RAII-destroy the
-      // flow at connection close — no leak.
-      auto handoff = std::make_unique<
-          Extensions::Common::QosmosDpi::QosmosFlowHandoff>(
-          std::move(classifier_), cache_key_,
-          absl::optional<bool>(verdict_is_web), config_->engine(),
-          bytes_peeked_this_pdu_);
-      cb_->filterState().setData(
-          Extensions::Common::QosmosDpi::QosmosFlowHandoff::filterStateKey(),
-          std::move(handoff),
-          StreamInfo::FilterState::StateType::Mutable,
-          StreamInfo::FilterState::LifeSpan::Connection);
-      config_->stats().handed_off_to_correction_.inc();
-      handed_off_ = true;
-      // classifier_ is now empty; recordClassifierDestruction() will
-      // decrement flows_active_ via the handed_off_ branch.
+      if (!cache->put(cache_key_, verdict_is_web, "4pkt")) {
+        config_->stats().verdict_cache_reject_full_.inc();
+      }
+      config_->stats().verdict_cache_size_.set(cache->size());
+
+      if (cr.final_state) {
+        // Rare: the engine already reached a final classification on this
+        // very first PDU. Nothing to correct — finalize the flow here and
+        // don't burden the correction filter with a hand-off. Also promote
+        // the cache entry to final immediately.
+        cache->put(cache_key_, verdict_is_web, "final");
+        classifier_->finalize();
+      } else {
+        // Park the live classifier in FilterState for the correction filter
+        // to pick up on the network-filter side. If no correction filter is
+        // present in filter_chains, ~QosmosFlowHandoff will RAII-destroy the
+        // flow at connection close — no leak.
+        auto handoff = std::make_unique<
+            Extensions::Common::QosmosDpi::QosmosFlowHandoff>(
+            std::move(classifier_), cache_key_,
+            absl::optional<bool>(verdict_is_web), config_->engine(),
+            bytes_peeked_this_pdu_);
+        cb_->filterState().setData(
+            Extensions::Common::QosmosDpi::QosmosFlowHandoff::filterStateKey(),
+            std::move(handoff),
+            StreamInfo::FilterState::StateType::Mutable,
+            StreamInfo::FilterState::LifeSpan::Connection);
+        config_->stats().handed_off_to_correction_.inc();
+        handed_off_ = true;
+        // classifier_ is now empty; recordClassifierDestruction() will
+        // decrement flows_active_ via the handed_off_ branch.
+      }
     }
   }
 
@@ -608,6 +625,7 @@ void Filter::onSilenceTimeout() {
   config_->stats().silence_timeout_.inc();
 
   const bool correction_enabled =
+      config_->verdictCacheCorrectionEnabled() &&
       config_->verdictCacheForThisThread() != nullptr &&
       !dst_addr_.ip.empty() && classifier_ != nullptr &&
       classifier_->flowAlive() && cb_ != nullptr;
