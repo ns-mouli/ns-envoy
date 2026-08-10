@@ -12,6 +12,7 @@
 !\.coveragerc
 !\.devcontainer
 !\.dockerignore
+!\.drone.yml
 !\.eslintrc.yml
 !\.flake8
 !\.gitattributes
