@@ -1,0 +1,151 @@
+---
+kind: pipeline
+type: docker
+name: ns-envoy-vcl-build
+
+trigger:
+  ref:
+    include:
+      - refs/heads/develop
+      - refs/heads/feature/http-ad-v132
+      - refs/pull/**
+
+global-variables:
+  environment: &default_env
+    # Tooling revision — must match the dataplane repo's .tooling file
+    # so the VPP23 .so ABI matches what the nsnwkfwlsvc pod runs.
+    # pr/u20_1242 contains the latest vpp23 with PP2 + verdict callback patches.
+    TOOLING_REVISION: pr/u20_1242
+
+steps:
+  - name: wait-for-sandbox
+    image: docker
+    commands:
+      - $DRONE_WORKSPACE/tools/drone/waitForSandbox.sh || true
+    volumes:
+      - name: sandbox-docker-sock
+        path: /var/run
+
+  - name: build-envoy-binary
+    image: artifactory-rd.netskope.io/drone/builder-2004:v13
+    pull: if-not-exists
+    user: root
+    environment:
+      <<: *default_env
+      # AWS S3 credentials for fetching tooling packages (vpp23, ixe-sdk)
+      NS_DP_TOOLING_READ_ACCESS_KEY_ID:
+        from_secret: ns_dp_tooling_read_access_key_id
+      NS_DP_TOOLING_READ_ACCESS_KEY:
+        from_secret: ns_dp_tooling_read_access_key
+      # Artifactory credentials for pushing the binary tarball
+      NS_ARTIFACTORY_USER:
+        from_secret: artifactory_user
+      NS_ARTIFACTORY_PASSWORD:
+        from_secret: artifactory_password
+      # Qosmos license path — provided as a Drone secret file
+      QOSMOS_LICENSE_PATH: /opt/3p/binary/ixe/license.bin
+    commands:
+      - export DRONE=true
+      - export NS_BUILD_DIR=$DRONE_WORKSPACE
+      - export ENVOY_PACKAGE_DIR=/tmp/envoy-pkg
+
+      # --- 1. Fetch tooling deps (vpp23 + ixe-sdk) from S3 ---
+      - echo "[CI] Fetching tooling deps from S3 (revision $TOOLING_REVISION) ..."
+      - pip3 install -q pyyaml requests boto3 || true
+      - |
+        python3 - <<'PYEOF'
+        import json, os, subprocess, sys, tarfile, boto3, tempfile
+
+        revision = os.environ["TOOLING_REVISION"]
+        bucket = "ns-dataplane-tooling"
+
+        s3 = boto3.client("s3",
+            aws_access_key_id=os.environ["NS_DP_TOOLING_READ_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ["NS_DP_TOOLING_READ_ACCESS_KEY"],
+            region_name="us-east-1")
+
+        # Download manifest to find package SHAs
+        resp = s3.get_object(Bucket=bucket, Key=f"{revision}")
+        manifest = resp["Body"].read().decode().strip().split("\n")
+        print(f"[CI] Manifest {revision} has {len(manifest)} entries")
+
+        wanted = {"vpp23", "ixe-sdk"}
+        for line in manifest:
+            parts = line.split(":")
+            if len(parts) < 3:
+                continue
+            blob_key, name, version = parts[0], parts[1], parts[2]
+            if name not in wanted:
+                continue
+            print(f"[CI] Fetching {name} v{version} ...")
+            dest = f"/tmp/{name}.tar.xz"
+            s3.download_file(bucket, blob_key, dest)
+            os.makedirs("/opt", exist_ok=True)
+            subprocess.run(["tar", "-xf", dest, "-C", "/opt"], check=True)
+            os.unlink(dest)
+            print(f"[CI] Installed {name} -> /opt")
+
+        print("[CI] Tooling deps installed")
+        PYEOF
+
+      # Verify deps
+      - test -f /opt/vpp23/lib/x86_64-linux-gnu/libvppcom.so.23.02 || { echo "ERROR: vpp23 not found"; exit 1; }
+      - test -f /opt/3p/binary/ixe/lib/libqmengine.fpic.a || { echo "ERROR: ixe-sdk not found"; exit 1; }
+
+      # --- 2. Build Envoy binary ---
+      - echo "[CI] Building Envoy VCL binary ..."
+      - cd $NS_BUILD_DIR
+      - bash netskope/build_ns_envoy_vcl.sh
+
+      # Verify binary
+      - test -f /opt/envoy-vcl/bin/envoy || { echo "ERROR: envoy binary not built"; exit 1; }
+      - /opt/envoy-vcl/bin/envoy --version || true
+
+      # --- 3. Package tarball ---
+      - echo "[CI] Packaging envoy-binary.tar.gz ..."
+      - test -f $ENVOY_PACKAGE_DIR/envoy-binary.tar.gz || { echo "ERROR: tarball not created"; exit 1; }
+      - ls -lh $ENVOY_PACKAGE_DIR/envoy-binary.tar.gz
+
+      # --- 4. Push to Artifactory ---
+      - |
+        if [ -n "$NS_ARTIFACTORY_USER" ] && [ -n "$NS_ARTIFACTORY_PASSWORD" ]; then
+          RTF_HOST="https://artifactory.netskope.io/artifactory"
+          RTF_PATH="netskope-sandbox-generic-origin/envoy-binary"
+          VERSION="${ENVOY_BINARY_VERSION:-1.0.0}"
+          echo "[CI] Pushing envoy-binary.tar.gz v$VERSION to Artifactory ..."
+          curl -u "$NS_ARTIFACTORY_USER:$NS_ARTIFACTORY_PASSWORD" \
+            -X PUT "$RTF_HOST/$RTF_PATH/$VERSION/envoy-binary.tar.gz" \
+            -T $ENVOY_PACKAGE_DIR/envoy-binary.tar.gz
+          echo "[CI] Pushed: $RTF_HOST/$RTF_PATH/$VERSION/envoy-binary.tar.gz"
+        else
+          echo "[CI] WARNING: Artifactory credentials not set — skipping push"
+        fi
+    volumes:
+      - name: sandbox-docker-sock
+        path: /var/run
+      - name: opt-ephemeral
+        path: /opt
+
+services:
+  - name: docker-sandbox
+    image: artifactory-rd.netskope.io/drone-plugins/docker-dind:latest
+    privileged: true
+    volumes:
+      - name: sandbox-docker-sock
+        path: /var/run
+
+volumes:
+  - name: sandbox-docker-sock
+    temp: {}
+  - name: opt-ephemeral
+    temp: {}
+
+slack_notify:
+  when:
+    status: [success, failure]
+  channel: drone
+
+email_notify:
+  when:
+    status: [failure]
+  to: ["${DRONE_COMMIT_AUTHOR_EMAIL}"]
