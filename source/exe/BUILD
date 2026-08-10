@@ -34,6 +34,20 @@ envoy_cc_binary(
     deps = [":envoy_main_entry_lib"],
 )
 
+# Minimal VCL build: Envoy + VCL socket interface + Qosmos DPI filter.
+# VPP VCL libs (vppcom, vppinfra, svm, vlibapi, vlibmemoryclient) are
+# linked dynamically at runtime from the Docker image's /lib/x86_64-linux-gnu/.
+# No VPP source compilation needed — uses prebuilt /opt/vpp23 .so files.
+envoy_cc_binary(
+    name = "envoy-vcl",
+    stamped = True,
+    deps = [
+        ":envoy_main_entry_lib",
+        "//contrib/vcl/source:config",
+        "//source/extensions/filters/listener/qosmos_dpi:config",
+    ],
+)
+
 envoy_cc_library(
     name = "all_extensions_lib",
     deps = [

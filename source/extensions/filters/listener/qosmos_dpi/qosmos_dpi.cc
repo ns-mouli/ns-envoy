@@ -20,6 +20,19 @@ extern "C" {
 #include "qmdpi_const.h"  // QMDPI_DIR_CTS
 }
 
+// Forward declaration — VCL verdict push is defined after the namespace close
+// to avoid vcl_io_handle.h namespace pollution (it introduces Envoy::Extensions::Network
+// which would shadow Envoy::Network::FilterStatus inside the QosmosDpi namespace).
+namespace Envoy {
+namespace Extensions {
+namespace ListenerFilters {
+namespace QosmosDpi {
+void qosmos_dpi_push_verdict(::Envoy::Network::IoHandle& io, bool is_web);
+}
+}
+}
+}
+
 namespace Envoy {
 namespace Extensions {
 namespace ListenerFilters {
@@ -218,7 +231,10 @@ Config::Config(const ProtoConfig& proto, ClassifierFactory factory,
 
 Extensions::Common::QosmosDpi::VerdictCache*
 Config::verdictCacheForThisThread() const {
-  if (!verdict_cache_correction_enabled_) return nullptr;
+  // Cache is available when either:
+  //  - correction is enabled (original design), OR
+  //  - cache is allocated with total_entries > 0 (VCL pipeline: use cache
+  //    without correction, promote entries to final immediately)
   if (test_verdict_cache_ != nullptr) return test_verdict_cache_;
   if (engine_ == nullptr || !engine_->verdictCacheEnabled()) return nullptr;
   return &engine_->cacheForThisThread();
@@ -335,22 +351,44 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
   const auto slice = buffer.rawSlice();
   config_->stats().bytes_processed_.recordValue(static_cast<uint64_t>(slice.len_));
 
+  // Skip inline_conn_info metadata prepended by prior service (socksproxy/ctap).
+  // Format: [4-byte hdr: m_msgLen(u16) + m_version(u16=3)] [TLVs...] [EOD]
+  // Without skipping, Qosmos sees the metadata instead of HTTP/TLS and
+  // returns base.ip.tcp (can't identify the protocol).
+  // We only skip for classification — the buffer and TCP seq/ack are NOT
+  // modified. tcp_proxy still forwards the full stream; downstream services
+  // (iproxy/appfwl) handle inline_conn_info in their own adapters.
+  const uint8_t* data = static_cast<const uint8_t*>(slice.mem_);
+  int data_len = static_cast<int>(slice.len_);
+  if (data_len >= 4) {
+    uint16_t meta_version = (data[2] << 8) | data[3];
+    if (meta_version == 3) {  // INLINE_CONN_INFO_VERSION_3
+      uint16_t meta_len = (data[0] << 8) | data[1];
+      if (meta_len > 0 && meta_len < data_len) {
+        ENVOY_LOG(debug, "qosmos_dpi: skipping inline_conn_info len={}", meta_len);
+        data += meta_len;
+        data_len -= meta_len;
+      }
+    }
+  }
+
   auto* cache = config_->verdictCacheForThisThread();
   const bool cache_available = cache != nullptr && !dst_addr_.ip.empty();
 
-  // When the cache is available we call classifyPdu (no flow_destroy) so
-  // the correction network filter — or this filter's own short-circuit
-  // branch below — controls the flow's fate. Otherwise, preserve today's
-  // classifyFirstPdu shape (single-shot, immediate flow_destroy).
+  // When the cache is available AND correction is enabled, we call
+  // classifyPdu (no flow_destroy) so the correction network filter controls
+  // the flow's fate. When correction is disabled (VCL pipeline — no
+  // correction filter), use classifyFirstPdu (single-shot, immediate
+  // flow_destroy) even with cache, to avoid QosmosFlowHandoff delays.
   ClassifyResult cr;
-  if (cache_available) {
+  if (cache_available && config_->verdictCacheCorrectionEnabled()) {
     cr = classifier_->classifyPdu(
-        slice.mem_, static_cast<int>(slice.len_), QMDPI_DIR_CTS,
+        data, data_len, QMDPI_DIR_CTS,
         static_cast<int>(config_->defaultTenantId()));
     bytes_peeked_this_pdu_ = slice.len_;
   } else {
     cr = classifier_->classifyFirstPdu(
-        slice.mem_, static_cast<int>(slice.len_), QMDPI_DIR_CTS,
+        data, data_len, QMDPI_DIR_CTS,
         static_cast<int>(config_->defaultTenantId()));
   }
   classify_invoked_ = true;
@@ -531,37 +569,50 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
     } else {
       config_->stats().verdict_cache_miss_.inc();
     }
-    if (!cache->put(cache_key_, verdict_is_web, "4pkt")) {
-      config_->stats().verdict_cache_reject_full_.inc();
-    }
-    config_->stats().verdict_cache_size_.set(cache->size());
 
-    if (cr.final_state) {
-      // Rare: the engine already reached a final classification on this
-      // very first PDU. Nothing to correct — finalize the flow here and
-      // don't burden the correction filter with a hand-off. Also promote
-      // the cache entry to final immediately.
+    // When correction is disabled (VCL pipeline), promote to final
+    // immediately — no correction filter to refine the verdict later.
+    // When correction is enabled, keep initial state and hand off.
+    if (!config_->verdictCacheCorrectionEnabled()) {
       cache->put(cache_key_, verdict_is_web, "final");
+      if (!cache->put(cache_key_, verdict_is_web, "final")) {
+        config_->stats().verdict_cache_reject_full_.inc();
+      }
+      config_->stats().verdict_cache_size_.set(cache->size());
       classifier_->finalize();
     } else {
-      // Park the live classifier in FilterState for the correction filter
-      // to pick up on the network-filter side. If no correction filter is
-      // present in filter_chains, ~QosmosFlowHandoff will RAII-destroy the
-      // flow at connection close — no leak.
-      auto handoff = std::make_unique<
-          Extensions::Common::QosmosDpi::QosmosFlowHandoff>(
-          std::move(classifier_), cache_key_,
-          absl::optional<bool>(verdict_is_web), config_->engine(),
-          bytes_peeked_this_pdu_);
-      cb_->filterState().setData(
-          Extensions::Common::QosmosDpi::QosmosFlowHandoff::filterStateKey(),
-          std::move(handoff),
-          StreamInfo::FilterState::StateType::Mutable,
-          StreamInfo::FilterState::LifeSpan::Connection);
-      config_->stats().handed_off_to_correction_.inc();
-      handed_off_ = true;
-      // classifier_ is now empty; recordClassifierDestruction() will
-      // decrement flows_active_ via the handed_off_ branch.
+      if (!cache->put(cache_key_, verdict_is_web, "4pkt")) {
+        config_->stats().verdict_cache_reject_full_.inc();
+      }
+      config_->stats().verdict_cache_size_.set(cache->size());
+
+      if (cr.final_state) {
+        // Rare: the engine already reached a final classification on this
+        // very first PDU. Nothing to correct — finalize the flow here and
+        // don't burden the correction filter with a hand-off. Also promote
+        // the cache entry to final immediately.
+        cache->put(cache_key_, verdict_is_web, "final");
+        classifier_->finalize();
+      } else {
+        // Park the live classifier in FilterState for the correction filter
+        // to pick up on the network-filter side. If no correction filter is
+        // present in filter_chains, ~QosmosFlowHandoff will RAII-destroy the
+        // flow at connection close — no leak.
+        auto handoff = std::make_unique<
+            Extensions::Common::QosmosDpi::QosmosFlowHandoff>(
+            std::move(classifier_), cache_key_,
+            absl::optional<bool>(verdict_is_web), config_->engine(),
+            bytes_peeked_this_pdu_);
+        cb_->filterState().setData(
+            Extensions::Common::QosmosDpi::QosmosFlowHandoff::filterStateKey(),
+            std::move(handoff),
+            StreamInfo::FilterState::StateType::Mutable,
+            StreamInfo::FilterState::LifeSpan::Connection);
+        config_->stats().handed_off_to_correction_.inc();
+        handed_off_ = true;
+        // classifier_ is now empty; recordClassifierDestruction() will
+        // decrement flows_active_ via the handed_off_ branch.
+      }
     }
   }
 
@@ -574,6 +625,7 @@ void Filter::onSilenceTimeout() {
   config_->stats().silence_timeout_.inc();
 
   const bool correction_enabled =
+      config_->verdictCacheCorrectionEnabled() &&
       config_->verdictCacheForThisThread() != nullptr &&
       !dst_addr_.ip.empty() && classifier_ != nullptr &&
       classifier_->flowAlive() && cb_ != nullptr;
@@ -630,6 +682,12 @@ void Filter::setVerdict(absl::string_view cluster_name, bool is_web) {
     config_->stats().non_web_classified_.inc();
   }
 
+  // Push verdict to VPP via VCL ctrl_mq so ns-envoy-adapter can set
+  // fctx->is_web for iproxy skip/keep routing in the NSH service chain.
+  if (cb_ != nullptr) {
+    qosmos_dpi_push_verdict(cb_->socket().ioHandle(), is_web);
+  }
+
   if (cb_ == nullptr) return;
   cb_->filterState().setData(
       TcpProxy::PerConnectionCluster::key(),
@@ -642,3 +700,24 @@ void Filter::setVerdict(absl::string_view cluster_name, bool is_web) {
 }  // namespace ListenerFilters
 }  // namespace Extensions
 }  // namespace Envoy
+
+// VCL verdict push implementation — outside all namespaces to avoid
+// vcl_io_handle.h namespace pollution. The VCL header introduces
+// Envoy::Extensions::Network which would shadow Envoy::Network inside
+// the QosmosDpi namespace (causing Network::FilterStatus lookup failures).
+#include "contrib/vcl/source/vcl_io_handle.h"
+
+extern "C" {
+// vppcom_set_verdict is added by Netskope VPP patches — not in upstream
+// vppcom.h. Declare it here since the prebuilt /opt/vpp23 header may not
+// have it.
+extern int vppcom_set_verdict(int fd, uint8_t is_web);
+}
+
+void Envoy::Extensions::ListenerFilters::QosmosDpi::qosmos_dpi_push_verdict(
+    ::Envoy::Network::IoHandle& io, bool is_web) {
+  auto* vcl_io = dynamic_cast<Envoy::Extensions::Network::Vcl::VclIoHandle*>(&io);
+  if (vcl_io) {
+    vppcom_set_verdict(vcl_io->sh(), is_web ? 1 : 0);
+  }
+}

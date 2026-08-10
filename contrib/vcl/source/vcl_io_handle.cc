@@ -116,6 +116,9 @@ Api::IoCallUint64Result vclCallResultToIoCallResult(const int32_t result) {
     return {static_cast<unsigned long>(result), Api::IoError::none()};
   }
   RELEASE_ASSERT(result != VPPCOM_EINVAL, "Invalid argument passed in.");
+  if (result != VPPCOM_EAGAIN) {
+    ENVOY_LOG_MISC(warn, "vcl error: result={} (non-EAGAIN)", result);
+  }
   return {/*rc=*/0, (result == VPPCOM_EAGAIN
                          // EAGAIN is frequent enough that its memory allocation should be avoided.
                          ? Envoy::Network::IoSocketError::getIoSocketEagainError()
@@ -184,6 +187,7 @@ Api::IoCallUint64Result VclIoHandle::readv(uint64_t max_length, Buffer::RawSlice
     slice_length = std::min(slices[i].len_, static_cast<size_t>(max_length - num_bytes_read));
     rv = vppcom_session_read(sh_, slices[i].mem_, slice_length);
     if (rv < 0) {
+      ENVOY_LOG_MISC(warn, "[{}] readv error: sh={:x} rv={}", vclWrkIndexOrRegister(), sh_, rv);
       break;
     }
     num_bytes_read += rv;
@@ -256,6 +260,7 @@ Api::IoCallUint64Result VclIoHandle::writev(const Buffer::RawSlice* slices, uint
   for (uint64_t i = 0; i < num_slice; i++) {
     rv = vppcom_session_write(sh_, slices[i].mem_, slices[i].len_);
     if (rv < 0) {
+      ENVOY_LOG_MISC(warn, "[{}] writev error: sh={:x} rv={}", vclWrkIndexOrRegister(), sh_, rv);
       break;
     }
     num_bytes_written += rv;
@@ -430,8 +435,12 @@ Envoy::Network::IoHandlePtr VclIoHandle::accept(sockaddr* addr, socklen_t* addrl
   int new_sh = vppcom_session_accept(sh, &endpt, O_NONBLOCK);
   if (new_sh >= 0) {
     vclEndptCopy(addr, addrlen, endpt);
+    ENVOY_LOG_MISC(info, "[{}] accept success: listener_sh={:x} new_sh={:x}",
+                   wrk_index, sh, (uint32_t)new_sh);
     return std::make_unique<VclIoHandle>(new_sh, VclInvalidFd);
   }
+  ENVOY_LOG_MISC(warn, "[{}] accept failed: listener_sh={:x} rv={}",
+                 wrk_index, sh, new_sh);
   return nullptr;
 }
 
@@ -445,6 +454,8 @@ VclIoHandle::connect(Envoy::Network::Address::InstanceConstSharedPtr address) {
   endpt.ip = ipaddr;
   vclEndptFromAddress(endpt, address);
   int32_t rv = vppcom_session_connect(sh_, &endpt);
+  ENVOY_LOG_MISC(info, "[{}] connect: sh={:x} rv={} addr={}",
+                 vclWrkIndexOrRegister(), sh_, rv, address->asString());
   return {rv < 0 ? -1 : 0, -rv};
 }
 

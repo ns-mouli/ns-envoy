@@ -1,0 +1,106 @@
+node:
+  id: cfw-nwkfwl-envoy
+  cluster: cfw-nwkfwl
+
+static_resources:
+  listeners:
+  # Front listener (Legs ①②): VPP TCP terminates the client connection and
+  # delivers it to Envoy's VCL listener at 10.0.0.100:9000. The plugin DNATs
+  # the overlay dst to this listener and routes through ns-svc-output →
+  # ip4-lookup → ip4-local → tcp-input. VPP TCP owns the real client seq/ack.
+  #
+  # Original destination is recovered via PP2 injection: the VPP session layer
+  # injects a PROXY Protocol v2 header (with the real orig_dst) into the
+  # session's rx_fifo on accept. The proxy_protocol listener filter parses it
+  # and calls restoreLocalAddress(orig_dst), so the ORIGINAL_DST clusters can
+  # route upstream to the real origin.
+  #
+  # Qosmos DPI listener filter classifies the first client data PDU as web or
+  # non-web and sets PerConnectionCluster to select the upstream cluster:
+  #   - web → proxy_cluster (keeps iproxy in NSH service chain)
+  #   - non-web → cfw_cluster (skips iproxy, goes to appfwl → nat)
+  # Both clusters are ORIGINAL_DST — they connect to the real origin recovered
+  # from the PP2 header. The difference is in how back-cls routes the upstream
+  # SYN through the NSH service chain (is_web flag in flow context).
+  - name: front_vcl_tcp
+    address:
+      socket_address:
+        address: 10.0.0.100
+        port_value: 9000
+    listener_filters:
+    - name: envoy.filters.listener.proxy_protocol
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.listener.proxy_protocol.v3.ProxyProtocol
+    - name: envoy.filters.listener.qosmos_dpi
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.listener.qosmos_dpi.v3.QosmosDpi
+        # protocol_bundle_path omitted ⇒ use statically-linked libqmbundle.
+        protocol_table_path: /etc/service_conf/qosmos_protocols.json
+        web_cluster: proxy_cluster
+        non_web_cluster: cfw_cluster
+        silence_timeout: 0.200s
+        max_inspect_bytes: 1024
+        default_tenant_id: 1144
+        # Verdict cache (ns-envoy feature): per-worker cache for classification
+        # accuracy. Correction filter (qosmos_dpi_correction) refines verdict
+        # on subsequent PDUs.
+        verdict_cache_correction_enabled: true
+        verdict_cache_total_entries: 100000
+        total_nb_flows: 300000
+    filter_chains:
+    - filter_chain_match: {}
+      filters:
+      - name: envoy.filters.network.qosmos_dpi_correction
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.qosmos_dpi_correction.v3.QosmosDpiCorrection
+          correction_timeout: 5s
+          max_correction_bytes: 65536
+          max_correction_pdus: 64
+      - name: envoy.filters.network.tcp_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+          stat_prefix: vcl_tcp_front
+          # Fallback cluster; overridden per-connection by Qosmos DPI filter
+          # via PerConnectionCluster in FilterState.
+          cluster: cfw_cluster
+          access_log:
+          - name: envoy.access_loggers.stdout
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+              log_format:
+                text_format_source:
+                  inline_string: "[PROXY] %START_TIME% %DOWNSTREAM_REMOTE_ADDRESS% -> %UPSTREAM_HOST% cluster=%UPSTREAM_CLUSTER% bytes_rx=%DOWNSTREAM_WIRE_BYTES_RECEIVED% bytes_tx=%UPSTREAM_WIRE_BYTES_RECEIVED%\n"
+
+  clusters:
+  # Web cluster (Legs ③④): for flows classified as web by Qosmos DPI.
+  # back-cls keeps iproxy in the NSH service chain → proxy adapter → nsproxy.
+  - name: proxy_cluster
+    type: ORIGINAL_DST
+    lb_policy: CLUSTER_PROVIDED
+    connect_timeout: 10s
+    upstream_connection_options:
+      tcp_keepalive:
+        keepalive_time: 30
+
+  # Non-web cluster (Legs ③④): for flows classified as non-web by Qosmos DPI
+  # (or silence timeout / error fail-safe). back-cls skips iproxy via
+  # ns_svc_skip_svc_id(b0, iproxy_svc_id) → appfwl → nat → origin.
+  - name: cfw_cluster
+    type: ORIGINAL_DST
+    lb_policy: CLUSTER_PROVIDED
+    connect_timeout: 10s
+    upstream_connection_options:
+      tcp_keepalive:
+        keepalive_time: 30
+
+default_socket_interface: envoy.extensions.vcl.vcl_socket_interface
+
+bootstrap_extensions:
+- name: envoy.bootstrap.vcl
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.vcl.v3alpha.VclSocketInterface
+
+admin:
+  address:
+    pipe:
+      path: /tmp/envoy-admin.sock

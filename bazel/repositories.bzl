@@ -187,29 +187,30 @@ def envoy_dependencies(skip_targets = []):
     _io_opencensus_cpp()
     _com_github_curl()
     _com_github_envoyproxy_sqlparser()
-    _v8()
+    # Heavy deps disabled for minimal VCL L4 proxy build:
+    # _v8()
     _com_googlesource_chromium_base_trace_event_common()
     _com_github_google_quiche()
     _com_googlesource_googleurl()
-    _io_hyperscan()
-    _io_vectorscan()
+    # _io_hyperscan()
+    # _io_vectorscan()
     _io_opentelemetry_api_cpp()
-    _net_colm_open_source_colm()
-    _net_colm_open_source_ragel()
+    # _net_colm_open_source_colm()
+    # _net_colm_open_source_ragel()
     _net_zlib()
     _intel_dlb()
     _com_github_zlib_ng_zlib_ng()
-    _org_boost()
+    # _org_boost()
     _org_brotli()
     _com_github_facebook_zstd()
     _re2()
     _proxy_wasm_cpp_sdk()
     _proxy_wasm_cpp_host()
-    _emsdk()
+    # _emsdk()
     _rules_fuzzing()
     external_http_archive("proxy_wasm_rust_sdk")
     _com_google_cel_cpp()
-    _com_github_google_perfetto()
+    # _com_github_google_perfetto()
     _utf8_range()
     _rules_ruby()
     external_http_archive(
@@ -232,7 +233,7 @@ def envoy_dependencies(skip_targets = []):
         patches = ["@envoy//bazel:aspect.patch"],
     )
 
-    _com_github_fdio_vpp_vcl()
+    # _com_github_fdio_vpp_vcl()  # Overridden by contrib/vcl prebuilt /opt/vpp23
 
     # Unconditional, since we use this only for compiler-agnostic fuzzing utils.
     _org_llvm_releases_compiler_rt()
@@ -240,11 +241,11 @@ def envoy_dependencies(skip_targets = []):
     _cc_deps()
     _go_deps(skip_targets)
     _rust_deps()
-    _kafka_deps()
+    # _kafka_deps()
 
-    _com_github_wamr()
-    _com_github_wasmtime()
-    _com_github_wasm_c_api()
+    # _com_github_wamr()
+    # _com_github_wasmtime()
+    # _com_github_wasm_c_api()
 
     switched_rules_by_language(
         name = "com_google_googleapis_imports",
@@ -971,11 +972,7 @@ filegroup(
     )
 
 def _com_github_fdio_vpp_vcl():
-    external_http_archive(
-        name = "com_github_fdio_vpp_vcl",
-        build_file_content = _build_all_content(exclude = ["**/*doc*/**", "**/examples/**", "**/plugins/**"]),
-        patches = ["@envoy//bazel/foreign_cc:vpp_vcl.patch"],
-    )
+    pass  # No-op: ns-envoy links VPP dynamically via /opt/vpp23 .so files
 
 def _utf8_range():
     external_http_archive("utf8_range")

@@ -135,6 +135,7 @@ envoy_cc_library(
         "@envoy_api//envoy/service/route/v3:pkg_cc_proto",
         "@envoy_api//envoy/service/runtime/v3:pkg_cc_proto",
         "@envoy_api//envoy/service/secret/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/filters/listener/qosmos_dpi/v3:pkg_cc_proto",
     ],
 )
 
