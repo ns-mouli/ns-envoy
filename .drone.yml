@@ -42,8 +42,9 @@ steps:
         from_secret: artifactory_user
       NS_ARTIFACTORY_PASSWORD:
         from_secret: artifactory_password
-      # Qosmos license path — provided as a Drone secret file
-      QOSMOS_LICENSE_PATH: /opt/3p/binary/ixe/license.bin
+      # Qosmos license — staged by the script to /opt/3p/binary/ixe/Q1800801-20181221.bin
+      # The filename is critical: license_patcher.pl derives serial from basename
+      QOSMOS_LICENSE_PATH: /opt/3p/binary/ixe/Q1800801-20181221.bin
     commands:
       - export DRONE=true
       - export NS_BUILD_DIR=$DRONE_WORKSPACE
@@ -91,6 +92,20 @@ steps:
       # Verify deps
       - test -f /opt/vpp23/lib/x86_64-linux-gnu/libvppcom.so.23.02 || { echo "ERROR: vpp23 not found"; exit 1; }
       - test -f /opt/3p/binary/ixe/lib/libqmengine.fpic.a || { echo "ERROR: ixe-sdk not found"; exit 1; }
+
+      # Stage Qosmos license — the filename MUST be Q1800801-20181221.bin
+      # because license_patcher.pl derives the serial from the basename.
+      # The license is stored as a Drone secret file mounted at /run/secrets/qosmos_license.bin
+      - |
+        if [ -f /run/secrets/qosmos_license.bin ]; then
+          cp /run/secrets/qosmos_license.bin /opt/3p/binary/ixe/Q1800801-20181221.bin
+          echo "[CI] Qosmos license staged from Drone secret"
+        elif [ -n "${QOSMOS_LICENSE_URL:-}" ]; then
+          wget -qO /opt/3p/binary/ixe/Q1800801-20181221.bin "$QOSMOS_LICENSE_URL"
+          echo "[CI] Qosmos license downloaded from URL"
+        else
+          echo "[CI] WARNING: No Qosmos license available — envoy will fail to start"
+        fi
 
       # --- 2. Build Envoy binary ---
       - echo "[CI] Building Envoy VCL binary ..."

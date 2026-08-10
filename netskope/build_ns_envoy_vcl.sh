@@ -13,7 +13,10 @@ set -eu
 
 destination=/opt/envoy-vcl
 wd=$(pwd)
-QOSMOS_LICENSE_PATH="${QOSMOS_LICENSE_PATH:-/opt/3p/binary/ixe/license.bin}"
+# The license filename MUST contain the serial number (Q1800801) because
+# license_patcher.pl derives the serial from basename: s/^(.*)-[0-9]{8}\.bin/$1/
+# A generic name like "license.bin" produces serial "license" → wrong key → crash.
+QOSMOS_LICENSE_PATH="${QOSMOS_LICENSE_PATH:-/opt/3p/binary/ixe/Q1800801-20181221.bin}"
 
 # --- 0. Install CI prerequisites (no-op if already present) ---
 if ! command -v python3 &> /dev/null; then
